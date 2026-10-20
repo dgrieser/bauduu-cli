@@ -11,6 +11,7 @@ customer area. It logs in and prints the account sections as tables (or JSON):
 | `buchungen`    | Deine Buchung                      | Bookings/subscriptions with price and period                    |
 | `daten`        | Deine Daten                        | Account, customer, delivery and SEPA data (IBAN masked)         |
 | `all` / none   | everything                         | All of the above                                                |
+| `watch`        | Bisherige Sets                     | Detect changes since the last run and notify (for cron)         |
 
 German aliases and English aliases work too (`wishlist`, `history`, `returns`,
 `subscriptions`, `profile`, …).
@@ -77,6 +78,54 @@ Retouren (6)
 2 Retouren · Ø 42 Tage ausgeliehen · 6 Bonussteine
 Aktuell zu Hause: Riesenrad 3in1 (31119), versendet 2026-10-14, seit 6 Tagen
 ```
+
+## Watch for changes (cron)
+
+`bauduu watch` compares Bisherige Sets with the previous run and reports
+newly shipped sets, booked returns, status and bonus brick changes. The first
+run stores a baseline. Without changes it prints nothing, so cron stays quiet.
+
+`--notify` takes a `/bin/sh` command template. `{{title}}` and
+`{{description}}` (alias `{{desc}}`) become quoted references to the
+environment variables `BAUDUU_TITLE` and `BAUDUU_DESCRIPTION`, which carry
+the values. Text from the site is therefore never parsed as shell syntax. The
+quoting adapts to where the placeholder stands (bare, inside `"..."`, `'...'`,
+`$(...)` or backticks), so titles and descriptions with quotes, `$`,
+backticks or line breaks reach the command unchanged as one argument each.
+`--dry-run` prints the equivalent standalone command:
+
+```sh
+$ bauduu watch --test --dry-run --notify 'notify -t {{title}} -d {{description}}'
+BAUDUU_TITLE='Bauduu: Testbenachrichtigung' BAUDUU_DESCRIPTION='…' /bin/sh -c 'notify -t "$BAUDUU_TITLE" -d "$BAUDUU_DESCRIPTION"'
+```
+
+Send a test notification:
+
+```sh
+bauduu watch --test --notify 'notify -t {{title}} -d {{description}}'
+```
+
+Crontab entry (more variants in [`examples/crontab`](examples/crontab)):
+
+```cron
+*/30 * * * * /usr/local/bin/bauduu watch --notify '/usr/local/bin/notify -t {{title}} -d {{description}}'
+```
+
+Example notification:
+
+```
+Title:       Bauduu: Retour verbucht: Arktis Basislager
+Description: Retour verbucht: Arktis Basislager (60036) am 2026-06-09 nach 42 Tagen; Bonussteine Arktis Basislager (60036): +3 (jetzt 3)
+```
+
+Several changes in one run are combined: the title then reads
+`Bauduu: 3 Änderungen bei Bisherige Sets`, with one description line each.
+
+The state lives in `$XDG_STATE_HOME/bauduu/sets-<user>-<hash>.json` (default
+`~/.local/state/...`, override with `--state`); a state file of another
+account is refused. It is saved only after the
+notify command succeeded, so a failed notification is retried next run.
+Remember that crontab treats `%` as a newline: write `\%`.
 
 ## Notes
 

@@ -1,0 +1,33 @@
+# bauduu: check "Bisherige Sets" every 30 minutes and notify on changes.
+# Install with `crontab -e` and paste the lines you need.
+#
+# Before the first cron run:
+#   bauduu login --save        # store credentials (~/.config/bauduu/config, 0600)
+#   bauduu watch               # store the current list as the baseline
+#   bauduu watch --test --notify '<your command>'   # check the notifier
+#
+# --notify is a /bin/sh command template; edit the command freely.
+# {{title}} and {{description}} become properly quoted references to
+# $BAUDUU_TITLE / $BAUDUU_DESCRIPTION: write them bare, inside "...", '...',
+# $(...) or backticks, each value arrives as one argument, and text from the
+# site is never interpreted by the shell.
+#
+# Crontab pitfalls:
+#   - % is a newline in crontab commands; write it as \%.
+#   - cron has a minimal PATH; use absolute paths.
+#   - Nothing is printed when nothing changed, so cron sends no mail. Errors
+#     (site down, wrong password, failing notifier) go to stderr and cron
+#     mails them. A failed notification is retried on the next run.
+
+# Generic notifier taking a title and a description:
+*/30 * * * * /usr/local/bin/bauduu watch --notify '/usr/local/bin/notify -t {{title}} -d {{description}}'
+
+# ntfy.sh push notification (title inside double quotes works as well):
+#*/30 * * * * /usr/local/bin/bauduu watch --notify 'curl -fsS -H "Title: {{title}}" -d {{description}} https://ntfy.sh/my-bauduu-topic >/dev/null'
+
+# Desktop notification; cron has no session bus, so point it at yours:
+#*/30 * * * * DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus /usr/local/bin/bauduu watch --notify 'notify-send -a bauduu {{title}} {{description}}'
+
+# Plain cron mail: without --notify, title and description go to stdout.
+#MAILTO=you@example.com
+#*/30 * * * * /usr/local/bin/bauduu watch

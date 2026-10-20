@@ -120,6 +120,7 @@ Credentials come from --user, BAUDUU_USER/BAUDUU_PASSWORD, the config file
 		sectionCmd("buchungen", []string{"buchung", "abo", "subscriptions"}, "Show bookings/subscriptions", secSubscriptions),
 		sectionCmd("daten", []string{"deine-daten", "profile", "me"}, "Show Deine Daten (account and customer data)", secProfile),
 		newLoginCmd(opts),
+		newWatchCmd(opts),
 	)
 	return root
 }

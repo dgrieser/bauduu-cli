@@ -26,6 +26,23 @@ func (d Date) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.Format(time.DateOnly))
 }
 
+func (d *Date) UnmarshalJSON(b []byte) error {
+	var s *string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	if s == nil || *s == "" {
+		*d = Date{}
+		return nil
+	}
+	t, err := time.Parse(time.DateOnly, *s)
+	if err != nil {
+		return err
+	}
+	*d = Date{t}
+	return nil
+}
+
 // DaysUntil returns the whole days from d to end, or -1 if d is unset.
 func (d Date) DaysUntil(end time.Time) int {
 	if d.IsZero() {
