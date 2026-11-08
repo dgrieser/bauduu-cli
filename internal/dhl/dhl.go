@@ -76,7 +76,7 @@ type Shipment struct {
 // Fingerprint changes whenever something worth reporting changes.
 func (s *Shipment) Fingerprint() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s|%t|%s|%d|%s", s.Status, s.Delivered, s.NotFound, len(s.Events), s.DeliveryFrom)
+	fmt.Fprintf(&b, "%s|%s|%t|%s|%d|%s|%s", s.Status, s.StatusTime.UTC(), s.Delivered, s.NotFound, len(s.Events), s.DeliveryFrom.UTC(), s.DeliveryTo.UTC())
 	return b.String()
 }
 
@@ -264,10 +264,11 @@ func (c *Client) Track(ctx context.Context, code, zip string) (*Shipment, error)
 	if err := c.do(ctx, http.MethodPost, pathShipment, nil, payload, &detail); err != nil {
 		return s, fmt.Errorf("DHL: Details mit PLZ %s: %w", zip, err)
 	}
-	if d, err := detail.shipment(code); err == nil {
-		return d, nil
+	d, err := detail.shipment(code)
+	if err != nil {
+		return s, fmt.Errorf("DHL: Details mit PLZ %s: %w", zip, err)
 	}
-	return s, nil
+	return d, nil
 }
 
 // searchResult is the JSON answer of search and shipment.

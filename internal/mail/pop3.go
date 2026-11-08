@@ -165,6 +165,7 @@ func fetchPOP3(ctx context.Context, cfg Config, f Filter) ([]Message, error) {
 	}
 	var msgs []Message
 	older := 0
+	hasTOP := true
 	for n := count; n >= 1 && older < olderInARow; n-- {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -175,9 +176,22 @@ func fetchPOP3(ctx context.Context, cfg Config, f Filter) ([]Message, error) {
 			continue
 		}
 		// Headers first, so only matching messages are downloaded whole.
-		head, err := p.body("TOP %d 0", n)
-		if err != nil {
-			return nil, fmt.Errorf("POP3 TOP %d: %w", n, err)
+		// TOP is optional (RFC 1939); without it every message is retrieved.
+		var head, raw string
+		if hasTOP {
+			head, err = p.body("TOP %d 0", n)
+			var e errPOP3
+			if errors.As(err, &e) {
+				hasTOP = false
+			} else if err != nil {
+				return nil, fmt.Errorf("POP3 TOP %d: %w", n, err)
+			}
+		}
+		if !hasTOP {
+			if raw, err = p.body("RETR %d", n); err != nil {
+				return nil, fmt.Errorf("POP3 RETR %d: %w", n, err)
+			}
+			head = raw
 		}
 		hm, err := parseHeader(strings.NewReader(head + "\r\n"))
 		if err != nil {
@@ -197,9 +211,10 @@ func fetchPOP3(ctx context.Context, cfg Config, f Filter) ([]Message, error) {
 				continue
 			}
 		}
-		raw, err := p.body("RETR %d", n)
-		if err != nil {
-			return nil, fmt.Errorf("POP3 RETR %d: %w", n, err)
+		if raw == "" {
+			if raw, err = p.body("RETR %d", n); err != nil {
+				return nil, fmt.Errorf("POP3 RETR %d: %w", n, err)
+			}
 		}
 		m, err := parse(strings.NewReader(raw))
 		if err != nil {

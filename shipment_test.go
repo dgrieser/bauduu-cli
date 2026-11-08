@@ -61,6 +61,15 @@ func TestAssignNotices(t *testing.T) {
 	if got := mailSince(pending, time.Now()); !got.Equal(day("2026-10-09").Time) {
 		t.Errorf("since = %v", got)
 	}
+	// An undated loan does not cut off an older one.
+	now := day("2026-11-08").Time
+	undated := []bauduu.Loan{{ID: 10, Status: "Ausgeliehen"}, pending[1]}
+	if got := mailSince(undated, now); !got.Equal(day("2026-10-09").Time) {
+		t.Errorf("since with undated loan = %v", got)
+	}
+	if got := mailSince(undated[:1], now); !got.Equal(now.AddDate(0, 0, -30)) {
+		t.Errorf("since undated only = %v", got)
+	}
 	got := assignNotices(pending, known, mails)
 	if len(got) != 2 {
 		t.Fatalf("got %+v", got)
@@ -261,6 +270,94 @@ func TestUpdateShipmentsWarnsAndKeepsState(t *testing.T) {
 	}
 }
 
+func TestUpdateShipmentsKeepsHistoryWhenDetailsFail(t *testing.T) {
+	var mu sync.Mutex
+	detailsDown := true
+	events := []string{"angekündigt", "im Paketzentrum", "zugestellt"}
+	queries := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/int-verfolgen/data/config":
+			io.WriteString(w, `{"verfolgenCsrfToken":"t"}`)
+		case "/int-verfolgen/data/search":
+			// The public summary: current status, no history.
+			queries++
+			io.WriteString(w, `{"sendungen":[{"id":"C1","hasCompleteDetails":false,"sendungsdetails":{"istZugestellt":true,"sendungsverlauf":{"status":"zugestellt"}}}]}`)
+		case "/int-verfolgen/data/shipment":
+			if detailsDown {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			var ev []string
+			for i, e := range events {
+				ev = append(ev, fmt.Sprintf(`{"datum":"2026-11-0%dT10:00:00.000+01:00","status":%q}`, i+1, e))
+			}
+			fmt.Fprintf(w, `{"sendungen":[{"id":"C1","hasCompleteDetails":true,"sendungsdetails":{"istZugestellt":true,"sendungsverlauf":{"status":"zugestellt","events":[%s]}}}]}`, strings.Join(ev, ","))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	client, _ := dhl.New(srv.URL, 5*time.Second)
+	var warnings []error
+	env := &trackEnv{dhl: client, zip: "44579", warn: func(err error) { warnings = append(warnings, err) }}
+	loans := []bauduu.Loan{{ID: 8, SKU: "31119-1", Name: "Riesenrad 3in1 31119", Status: "Ausgeliehen"}}
+	old := &dhl.Shipment{Status: "angekündigt", Complete: true, Events: []dhl.Event{{Status: "angekündigt"}}}
+	prev := []trackedShipment{{LoanID: 8, Carrier: "DHL", Code: "C1", Tracking: old}}
+	ctx := context.Background()
+
+	u := updateShipments(ctx, env, loans, prev, nil, time.Now())
+	if len(warnings) != 1 {
+		t.Errorf("warnings = %v", warnings)
+	}
+	if tr := u.Shipments[0].Tracking; tr == nil || len(tr.Events) != 1 {
+		t.Fatalf("history lost: %+v", tr)
+	}
+	// Delivered by the summary, but the details are still missing.
+	if u.Shipments[0].done() {
+		t.Fatal("done without details")
+	}
+	mu.Lock()
+	detailsDown = false
+	mu.Unlock()
+	u = updateShipments(ctx, env, loans, u.Shipments, nil, time.Now())
+	if len(u.Changes) != 1 || !strings.Contains(u.Changes[0].Line, "im Paketzentrum") || !strings.Contains(u.Changes[0].Line, "zugestellt (") {
+		t.Errorf("after recovery = %+v", u.Changes)
+	}
+	before := queries
+	if u = updateShipments(ctx, env, loans, u.Shipments, nil, time.Now()); queries != before || len(u.Changes) != 0 {
+		t.Errorf("queried after delivery with details: %d → %d, %+v", before, queries, u.Changes)
+	}
+}
+
+func TestTrackingChangesStatusTime(t *testing.T) {
+	s := &trackedShipment{Code: "C1", Set: "Riesenrad 3in1 (31119)"}
+	at := time.Date(2026, 11, 9, 10, 0, 0, 0, time.Local)
+	old := &dhl.Shipment{Status: "im Paketzentrum bearbeitet", StatusTime: at}
+	cur := *old
+	if got := trackingChanges(s, old, &cur); len(got) != 0 {
+		t.Errorf("unchanged = %+v", got)
+	}
+	cur.StatusTime = at.Add(20 * time.Hour)
+	if got := trackingChanges(s, old, &cur); len(got) != 1 || !strings.Contains(got[0].Line, cur.StatusTime.Format("02.01. 15:04")) {
+		t.Errorf("same status, new time = %+v", got)
+	}
+}
+
+func TestTrackingChangesWindowEnd(t *testing.T) {
+	s := &trackedShipment{Code: "C1", Set: "Riesenrad 3in1 (31119)"}
+	from := time.Date(2026, 11, 9, 10, 0, 0, 0, time.Local)
+	old := &dhl.Shipment{Status: "unterwegs", DeliveryFrom: from, DeliveryTo: from.Add(2 * time.Hour)}
+	cur := *old
+	cur.DeliveryTo = from.Add(4 * time.Hour)
+	got := trackingChanges(s, old, &cur)
+	if len(got) != 1 || !strings.Contains(got[0].Line, "10:00–14:00") {
+		t.Errorf("changes = %+v", got)
+	}
+}
+
 func TestSummarizeMixed(t *testing.T) {
 	title, _ := summarize([]loanChange{{Title: "a", Line: "a"}, {Title: "b", Line: "b", Shipment: true}})
 	if title != "Bauduu: 2 Änderungen" {
@@ -302,6 +399,26 @@ func TestUpdateConfigKeepsOtherEntries(t *testing.T) {
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v", info.Mode().Perm())
+	}
+}
+
+func TestUpdateConfigReplacesDuplicateKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte("user = erika\npassword = a\ndhl_zip = 1\npassword = b\nDHL_ZIP = 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateConfig(path, "", []kv{{"password", "new"}, {keyDHLZip, ""}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg["password"] != "new" || cfg[keyDHLZip] != "" || cfg["user"] != "erika" {
+		t.Errorf("config = %v", cfg)
+	}
+	if b, _ := os.ReadFile(path); strings.Count(string(b), "password") != 1 {
+		t.Errorf("duplicates left:\n%s", b)
 	}
 }
 
@@ -385,5 +502,29 @@ func TestSetupMailNonInteractive(t *testing.T) {
 	cfg, _ := readConfig(path)
 	if cfg["user"] != "erika" || cfg[keyMailHost] != ms.Host || cfg[keyMailPassword] != "secret" || cfg[keyMailMailbox] != "INBOX" || cfg[keyMailFrom] != bauduu.ShippingSender {
 		t.Errorf("config = %v", cfg)
+	}
+}
+
+func TestNewTrackEnvLenient(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	// Mail settings without an account and a broken postal code.
+	if err := os.WriteFile(path, []byte("mail_host = imap.example.com\ndhl_zip = 123\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BAUDUU_DHL_ZIP", "")
+	t.Setenv("BAUDUU_MAIL_PASSWORD", "")
+	opts := &options{configPath: path, timeout: time.Second}
+	if _, err := newTrackEnv(opts, "", false, false, false, nil); err == nil {
+		t.Error("strict: no error")
+	}
+	if _, err := newTrackEnv(opts, "", true, false, false, nil); err == nil || !strings.Contains(err.Error(), "postal code") {
+		t.Errorf("strict zip = %v", err)
+	}
+	env, err := newTrackEnv(opts, "", false, false, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.mail != nil || env.zip != "" || env.dhl == nil {
+		t.Errorf("lenient env = %+v", env)
 	}
 }

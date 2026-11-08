@@ -192,8 +192,11 @@ type nopLogger struct{}
 
 func (nopLogger) Printf(string, ...any) {}
 
+// pop3Caps selects the optional POP3 commands the fake server supports.
+type pop3Caps struct{ uidl, top bool }
+
 // fakePOP3 serves msgs (number order) over implicit TLS; it fails on DELE.
-func fakePOP3(t *testing.T, serverTLS *tls.Config, msgs []string, uidl bool) net.Listener {
+func fakePOP3(t *testing.T, serverTLS *tls.Config, msgs []string, caps pop3Caps) net.Listener {
 	t.Helper()
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
 	if err != nil {
@@ -206,13 +209,13 @@ func fakePOP3(t *testing.T, serverTLS *tls.Config, msgs []string, uidl bool) net
 			if err != nil {
 				return
 			}
-			go servePOP3(t, conn, msgs, uidl)
+			go servePOP3(t, conn, msgs, caps)
 		}
 	}()
 	return ln
 }
 
-func servePOP3(t *testing.T, conn net.Conn, msgs []string, uidl bool) {
+func servePOP3(t *testing.T, conn net.Conn, msgs []string, caps pop3Caps) {
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
@@ -262,14 +265,14 @@ func servePOP3(t *testing.T, conn net.Conn, msgs []string, uidl bool) {
 			send("-ERR not authenticated")
 		case cmd == "STAT":
 			send("+OK %d 1000", len(msgs))
-		case cmd == "UIDL" && uidl:
+		case cmd == "UIDL" && caps.uidl:
 			send("+OK")
 			var b strings.Builder
 			for i := range msgs {
 				fmt.Fprintf(&b, "%d uid-%d\n", i+1, i+1)
 			}
 			dot(b.String())
-		case cmd == "TOP" && len(f) > 1:
+		case cmd == "TOP" && caps.top && len(f) > 1:
 			if m, ok := msg(f[1]); ok {
 				head, _, _ := strings.Cut(m, "\r\n\r\n")
 				send("+OK")
@@ -292,40 +295,92 @@ func servePOP3(t *testing.T, conn net.Conn, msgs []string, uidl bool) {
 	}
 }
 
+func TestTagSeparatesMailboxes(t *testing.T) {
+	base := Config{Protocol: IMAP, Host: "mail.example.com", Port: 993, User: "erika", Mailbox: "INBOX"}
+	other := []Config{base, base, base, base}
+	other[0].Host = "mail.example.org"
+	other[1].User = "max"
+	other[2].Mailbox = "Archiv"
+	other[3].Protocol = POP3
+	for _, c := range other {
+		if c.tag() == base.tag() {
+			t.Errorf("%+v shares the tag of %+v", c, base)
+		}
+	}
+	upper := base
+	upper.Host = "MAIL.example.com"
+	if upper.tag() != base.tag() {
+		t.Errorf("host case changes the tag")
+	}
+}
+
 func TestPOP3(t *testing.T) {
 	serverTLS, clientTLS := testTLS(t)
 	old := "From: bauduu@brickcoast.de\r\nSubject: Alt\r\nDate: Mon, 1 Jun 2026 10:00:00 +0200\r\n\r\nTrackingcode: 00340400000000000001\r\n"
 	other := "From: other@example.com\r\nSubject: Hi\r\nDate: Thu, 15 Oct 2026 10:00:00 +0200\r\n\r\n.leading dot\r\n"
 	msgs := []string{old, string(readFixture(t, "shipping_mail.eml")), other, string(readFixture(t, "shipping_mail_html.eml"))}
-	for _, uidl := range []bool{true, false} {
-		ln := fakePOP3(t, serverTLS, msgs, uidl)
+	for _, caps := range []pop3Caps{{uidl: true, top: true}, {uidl: false, top: true}, {uidl: true, top: false}} {
+		ln := fakePOP3(t, serverTLS, msgs, caps)
 		host, port := splitHostPort(t, ln.Addr().String())
 		cfg := Config{Protocol: POP3, Host: host, Port: port, User: "erika", Password: "secret", TLSConfig: clientTLS, Timeout: 5 * time.Second}
 		ctx := context.Background()
 		if n, err := Check(ctx, cfg); err != nil || n != 4 {
-			t.Fatalf("uidl=%v check = %d, %v", uidl, n, err)
+			t.Fatalf("%+v check = %d, %v", caps, n, err)
 		}
 		got, err := Fetch(ctx, cfg, Filter{From: "bauduu@brickcoast.de", Since: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(got) != 2 || !strings.Contains(got[0].Text, "Trackingcode: 00340434698381831612") || got[1].Subject != "Versandbestätigung" {
-			t.Fatalf("uidl=%v msgs = %+v", uidl, got)
+			t.Fatalf("%+v msgs = %+v", caps, got)
 		}
-		wantID := "uid-2"
-		if !uidl {
-			wantID = "shipping-1@brickcoast.de"
+		norm, _ := cfg.Normalize()
+		wantID := norm.tag() + "uid-2"
+		if !caps.uidl {
+			wantID = norm.tag() + "shipping-1@brickcoast.de"
 		}
 		if got[0].ID != wantID {
-			t.Errorf("uidl=%v id = %q, want %q", uidl, got[0].ID, wantID)
+			t.Errorf("%+v id = %q, want %q", caps, got[0].ID, wantID)
 		}
 		got, err = Fetch(ctx, cfg, Filter{From: "bauduu@brickcoast.de", Skip: func(id string) bool { return id == wantID }})
 		if err != nil || len(got) != 2 || got[0].Subject != "Alt" {
-			t.Errorf("uidl=%v skip = %+v, %v", uidl, got, err)
+			t.Errorf("%+v skip = %+v, %v", caps, got, err)
 		}
 		cfg.Password = "nope"
 		if _, err := Check(ctx, cfg); err == nil || !strings.Contains(err.Error(), "invalid password") {
 			t.Errorf("wrong password = %v", err)
 		}
+	}
+}
+
+// A server that stops answering must not hang the session, even when the
+// protocol client clears the socket deadline.
+func TestDialSessionLimit(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		// Accept, then say nothing until the client hangs up.
+		if c, err := ln.Accept(); err == nil {
+			c.Read(make([]byte, 1))
+			c.Close()
+		}
+	}()
+	host, port := splitHostPort(t, ln.Addr().String())
+	cfg := Config{Host: host, Port: port, Security: SecurityNone, Timeout: 50 * time.Millisecond}
+	conn, stop, err := dial(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	_ = conn.SetDeadline(time.Time{})
+	start := time.Now()
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Error("read succeeded")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("session limit not enforced: read blocked %v", d)
 	}
 }

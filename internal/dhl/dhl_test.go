@@ -65,6 +65,10 @@ func fakeDHL(t *testing.T, wantZip string) *httptest.Server {
 			http.Error(w, "bad", http.StatusBadRequest)
 			return
 		}
+		if body.Zip == "00000" {
+			io.WriteString(w, `{"sendungen":[]}`)
+			return
+		}
 		if body.Zip != wantZip {
 			w.WriteHeader(http.StatusBadRequest)
 			io.WriteString(w, `{"error":"Ihre Eingabe war fehlerhaft."}`)
@@ -123,6 +127,12 @@ func TestTrackWithZip(t *testing.T) {
 	}
 	if s == nil || s.Complete {
 		t.Errorf("wrong zip shipment = %+v", s)
+	}
+
+	// An answer without the shipment is an error too, with the summary.
+	s, err = c.Track(context.Background(), code, "00000")
+	if err == nil || !strings.Contains(err.Error(), "no shipment") || s == nil || s.Complete {
+		t.Errorf("empty details = %+v, %v", s, err)
 	}
 }
 

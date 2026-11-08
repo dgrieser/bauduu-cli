@@ -5,7 +5,9 @@ package mail
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -95,6 +97,12 @@ func DefaultPort(protocol, security string) int {
 	}
 }
 
+// tag is a short prefix that identifies the mailbox in message IDs.
+func (c Config) tag() string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{c.Protocol, strings.ToLower(c.Host), strconv.Itoa(c.Port), c.User, c.Mailbox}, "\x00")))
+	return hex.EncodeToString(sum[:4]) + ":"
+}
+
 func (c Config) addr() string {
 	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
@@ -112,8 +120,9 @@ func (c Config) tlsConfig() *tls.Config {
 
 // Message is one fetched mail, reduced to what is needed to read it.
 type Message struct {
-	// ID is stable across runs: "<uidvalidity>/<uid>" for IMAP, the UIDL
-	// for POP3 (or the Message-ID header when the server lacks UIDL).
+	// ID is stable across runs: a tag of the mailbox (protocol, server,
+	// account and folder), then "<uidvalidity>/<uid>" for IMAP, the UIDL for
+	// POP3 (or the Message-ID header when the server lacks UIDL).
 	ID      string    `json:"id"`
 	Date    time.Time `json:"date"`
 	From    string    `json:"from"`
@@ -162,6 +171,12 @@ func Fetch(ctx context.Context, cfg Config, f Filter) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	// UIDs and UIDLs are only unique within one mailbox; the tag keeps the
+	// IDs of another server, account or folder apart.
+	tag := cfg.tag()
+	if skip := f.Skip; skip != nil {
+		f.Skip = func(id string) bool { return skip(tag + id) }
+	}
 	var msgs []Message
 	if cfg.Protocol == POP3 {
 		msgs, err = fetchPOP3(ctx, cfg, f)
@@ -170,6 +185,11 @@ func Fetch(ctx context.Context, cfg Config, f Filter) ([]Message, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	for i := range msgs {
+		if msgs[i].ID != "" {
+			msgs[i].ID = tag + msgs[i].ID
+		}
 	}
 	sortByDate(msgs)
 	return msgs, nil
@@ -187,6 +207,9 @@ func Check(ctx context.Context, cfg Config) (int, error) {
 	return checkIMAP(ctx, cfg)
 }
 
+// sessionLimit times Config.Timeout is the longest a session may take.
+const sessionLimit = 4
+
 // dial opens the connection with implicit TLS when configured; STARTTLS is
 // negotiated by the protocol code. The connection is closed when ctx ends.
 func dial(ctx context.Context, cfg Config) (net.Conn, func(), error) {
@@ -202,12 +225,19 @@ func dial(ctx context.Context, cfg Config) (net.Conn, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect %s: %w", cfg.addr(), err)
 	}
-	// A whole session must not hang a cron job forever.
-	_ = conn.SetDeadline(time.Now().Add(4 * cfg.Timeout))
+	// A whole session must not hang a cron job forever. The deadline alone
+	// is not enough, as imapclient replaces it, so the connection is also
+	// closed when the session time is up.
+	limit := sessionLimit * cfg.Timeout
+	_ = conn.SetDeadline(time.Now().Add(limit))
+	timer := time.NewTimer(limit)
 	done := make(chan struct{})
 	go func() {
+		defer timer.Stop()
 		select {
 		case <-ctx.Done():
+			conn.Close()
+		case <-timer.C:
 			conn.Close()
 		case <-done:
 		}

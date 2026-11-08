@@ -328,7 +328,7 @@ func runWatch(ctx context.Context, out io.Writer, opts *options, w *watchOptions
 	if w.verbose {
 		verbose = out
 	}
-	env, err := newTrackEnv(opts, w.zip, w.noMail, w.noTracking, verbose)
+	env, err := newTrackEnv(opts, w.zip, w.noMail, w.noTracking, true, verbose)
 	if err != nil {
 		return err
 	}

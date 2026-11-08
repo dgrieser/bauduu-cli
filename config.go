@@ -91,6 +91,9 @@ func updateConfig(path, header string, set []kv) error {
 	for _, e := range set {
 		pending[strings.ToLower(e.Key)] = e.Value
 	}
+	// written marks keys already set; later duplicates of them are dropped,
+	// since readConfig would let the last occurrence win.
+	written := make(map[string]bool, len(set))
 	line := func(key, value string) string {
 		// Quote every value so any character, spaces at the edges included,
 		// survives the round trip through readConfig.
@@ -109,10 +112,10 @@ func updateConfig(path, header string, set []kv) error {
 		key = strings.ToLower(strings.TrimSpace(key))
 		if ok && !strings.HasPrefix(t, "#") {
 			if v, found := pending[key]; found {
-				delete(pending, key)
-				if v != "" {
+				if v != "" && !written[key] {
 					lines = append(lines, line(key, v))
 				}
+				written[key] = true
 				continue
 			}
 		}
@@ -120,10 +123,10 @@ func updateConfig(path, header string, set []kv) error {
 	}
 	for _, e := range set {
 		k := strings.ToLower(e.Key)
-		if v, found := pending[k]; found && v != "" {
+		if v := pending[k]; v != "" && !written[k] {
 			lines = append(lines, line(k, v))
 		}
-		delete(pending, k)
+		written[k] = true
 	}
 	return writeFilePrivate(path, strings.Join(lines, "\n")+"\n")
 }

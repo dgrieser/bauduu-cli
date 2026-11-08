@@ -30,6 +30,9 @@ type trackedShipment struct {
 	// Tracking is the last seen DHL state; nil before the first query.
 	Tracking *dhl.Shipment `json:"tracking,omitempty"`
 	Checked  time.Time     `json:"checked,omitzero"`
+	// DetailsFailed means Tracking is only the public summary because the
+	// details request failed; it is retried even after delivery.
+	DetailsFailed bool `json:"details_failed,omitempty"`
 }
 
 // trackable reports whether the carrier's tracking can be queried.
@@ -39,7 +42,7 @@ func (s *trackedShipment) trackable() bool {
 
 // done means there is nothing left to watch.
 func (s *trackedShipment) done() bool {
-	return s.Tracking != nil && s.Tracking.Delivered
+	return s.Tracking != nil && s.Tracking.Delivered && !s.DetailsFailed
 }
 
 // noticeMail is one mail from the shipping sender; Notice is nil when it
@@ -80,14 +83,15 @@ func pendingLoans(loans []bauduu.Loan, known []trackedShipment) []bauduu.Loan {
 }
 
 // mailSince is the first day a shipping mail for the pending loans can
-// have been sent.
+// have been sent; for a loan without a shipping date it is 30 days ago.
 func mailSince(pending []bauduu.Loan, now time.Time) time.Time {
-	since := time.Time{}
+	var since time.Time
 	for _, l := range pending {
-		if l.Shipped.IsZero() {
-			return now.AddDate(0, 0, -30)
+		d := now.AddDate(0, 0, -30)
+		if !l.Shipped.IsZero() {
+			d = l.Shipped.AddDate(0, 0, -maxMailOffsetDays)
 		}
-		if d := l.Shipped.AddDate(0, 0, -maxMailOffsetDays); since.IsZero() || d.Before(since) {
+		if since.IsZero() || d.Before(since) {
 			since = d
 		}
 	}
@@ -161,12 +165,11 @@ func assignNotices(pending []bauduu.Loan, known []trackedShipment, mails []notic
 
 // trackEnv bundles what shipment tracking needs.
 type trackEnv struct {
-	mail     *mailSettings // nil: no mailbox configured or disabled
-	zip      string
-	dhl      *dhl.Client // nil: tracking disabled
-	warn     func(error)
-	verbose  io.Writer
-	mailSeen map[string]bool
+	mail    *mailSettings // nil: no mailbox configured or disabled
+	zip     string
+	dhl     *dhl.Client // nil: tracking disabled
+	warn    func(error)
+	verbose io.Writer
 }
 
 // shipmentUpdate is the outcome of one tracking round.
@@ -248,11 +251,30 @@ func updateShipments(ctx context.Context, env *trackEnv, loans []bauduu.Loan, pr
 				continue
 			}
 		}
+		keepHistory(s.Tracking, cur)
 		u.Changes = append(u.Changes, trackingChanges(s, s.Tracking, cur)...)
 		s.Tracking = cur
+		s.DetailsFailed = err != nil
 		s.Checked = now.UTC().Truncate(time.Second)
 	}
 	return u
+}
+
+// keepHistory carries the known history over to cur when cur is only DHL's
+// public summary, for example because the details request failed. Otherwise
+// the next full answer would be compared against the summary and the events
+// in between would never be reported.
+func keepHistory(old, cur *dhl.Shipment) {
+	if old == nil || cur.NotFound != "" || len(cur.Events) >= len(old.Events) || (cur.Complete && !cur.ZipRequired) {
+		return
+	}
+	cur.Events = old.Events
+	if cur.Status == "" {
+		cur.Status = old.Status
+	}
+	if cur.Status == old.Status && cur.StatusTime.IsZero() {
+		cur.StatusTime = old.StatusTime
+	}
 }
 
 // trackingChanges describes what is new in cur compared to old: every new
@@ -277,7 +299,7 @@ func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 		for _, e := range cur.Events[oldEvents:] {
 			lines = append(lines, eventLine(e))
 		}
-	case cur.Status != "" && (old == nil || old.Status != cur.Status || cur.Delivered && !old.Delivered):
+	case cur.Status != "" && (old == nil || old.Status != cur.Status || !old.StatusTime.Equal(cur.StatusTime) || cur.Delivered && !old.Delivered):
 		// Without a known history (first query, details just unlocked by
 		// the postal code) only the current status is news.
 		line := cur.Status
@@ -288,7 +310,7 @@ func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 	case cur.NotFound != "" && (old == nil || old.NotFound != cur.NotFound):
 		lines = append(lines, cur.NotFound)
 	}
-	if len(lines) == 0 && old != nil && !old.DeliveryFrom.Equal(cur.DeliveryFrom) && !cur.DeliveryFrom.IsZero() {
+	if len(lines) == 0 && old != nil && !sameWindow(old, cur) && !cur.DeliveryFrom.IsZero() {
 		lines = append(lines, "Zustellung voraussichtlich "+deliveryWindow(cur))
 	}
 	if len(lines) == 0 {
@@ -299,7 +321,7 @@ func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 		status = lines[len(lines)-1]
 	}
 	desc := fmt.Sprintf("DHL %s (%s): %s", s.Code, shortSet(s.Set), strings.Join(lines, "; "))
-	if w := deliveryWindow(cur); w != "" && !cur.Delivered && (old == nil || !old.DeliveryFrom.Equal(cur.DeliveryFrom)) && !strings.Contains(desc, w) {
+	if w := deliveryWindow(cur); w != "" && !cur.Delivered && (old == nil || !sameWindow(old, cur)) && !strings.Contains(desc, w) {
 		desc += "; Zustellung voraussichtlich " + w
 	}
 	return []loanChange{{Title: title(status), Line: desc, Shipment: true}}
@@ -319,6 +341,11 @@ func eventLine(e dhl.Event) string {
 		b.WriteString(" (" + strings.Join(extra, ", ") + ")")
 	}
 	return b.String()
+}
+
+// sameWindow reports whether a and b announce the same delivery window.
+func sameWindow(a, b *dhl.Shipment) bool {
+	return a.DeliveryFrom.Equal(b.DeliveryFrom) && a.DeliveryTo.Equal(b.DeliveryTo)
 }
 
 func deliveryWindow(s *dhl.Shipment) string {
@@ -348,24 +375,31 @@ func shortSet(label string) string {
 	return label
 }
 
-// newTrackEnv prepares mailbox and DHL access as far as configured.
-func newTrackEnv(opts *options, zipFlag string, noMail, noTracking bool, verbose io.Writer) (*trackEnv, error) {
+// newTrackEnv prepares mailbox and DHL access as far as configured. With
+// lenient set, bad mail or postal code settings only cause a warning and turn
+// off that part, so watch keeps reporting the loan changes.
+func newTrackEnv(opts *options, zipFlag string, noMail, noTracking, lenient bool, verbose io.Writer) (*trackEnv, error) {
 	env := &trackEnv{
 		warn:    func(err error) { fmt.Fprintln(os.Stderr, "bauduu: warning:", err) },
 		verbose: verbose,
 	}
 	if !noMail {
 		s, ok, err := loadMailSettings(opts.configPath, opts.timeout)
-		if err != nil {
+		switch {
+		case err != nil && lenient:
+			env.warn(fmt.Errorf("mail settings: %w; mailbox not searched", err))
+		case err != nil:
 			return nil, fmt.Errorf("mail settings: %w", err)
-		}
-		if ok {
+		case ok:
 			env.mail = &s
 		}
 	}
 	if !noTracking {
 		zip, err := resolveZip(zipFlag, opts.configPath)
-		if err != nil {
+		switch {
+		case err != nil && lenient:
+			env.warn(fmt.Errorf("%w; DHL queried without postal code", err))
+		case err != nil:
 			return nil, err
 		}
 		env.zip = zip
@@ -476,7 +510,8 @@ func runTrack(ctx context.Context, out io.Writer, opts *options, f *trackFlags, 
 	if err := checkOutput(opts); err != nil {
 		return err
 	}
-	env, err := newTrackEnv(opts, f.zip, f.noMail, false, nil)
+	// Explicit codes need no mailbox, so its settings must not get in the way.
+	env, err := newTrackEnv(opts, f.zip, f.noMail || len(codes) > 0, false, false, nil)
 	if err != nil {
 		return err
 	}

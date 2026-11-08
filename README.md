@@ -167,8 +167,9 @@ DHL and reports each new status or history event
 bearbeitet.`) until the parcel is delivered (`Bauduu: Zugestellt: Riesenrad
 3in1`). The mailbox is not touched while every set at home has its code, and
 DHL is not queried after delivery. `--no-mail`, `--no-tracking` and `--zip`
-adjust this. Mailbox or DHL failures are printed as warnings on stderr; the
-other checks still run and the failed one is retried next time.
+adjust this. Mailbox or DHL failures, and broken mail or postal code
+settings, are printed as warnings on stderr; the other checks still run and
+the failed one is retried next time.
 
 `--notify` takes a `/bin/sh` command template. `{{title}}` and
 `{{description}}` (alias `{{desc}}`) become quoted references to the
