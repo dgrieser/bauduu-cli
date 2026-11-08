@@ -18,17 +18,23 @@ import (
 	"github.com/dgrieser/bauduu-cli/internal/bauduu"
 )
 
-// watchState is the last seen "Bisherige Sets" list, per account.
+// watchState is the last seen "Bisherige Sets" list, per account, and the
+// tracking state of the parcels of the sets at home.
 type watchState struct {
-	User    string        `json:"user"`
-	Checked time.Time     `json:"checked"`
-	Loans   []bauduu.Loan `json:"loans"`
+	User      string            `json:"user"`
+	Checked   time.Time         `json:"checked"`
+	Loans     []bauduu.Loan     `json:"loans"`
+	Shipments []trackedShipment `json:"shipments,omitempty"`
+	// MailSeen are mail IDs that need not be read again.
+	MailSeen []string `json:"mail_seen,omitempty"`
 }
 
 // loanChange is one detected difference, phrased for a notification.
 type loanChange struct {
 	Title string
 	Line  string
+	// Shipment marks tracking news rather than a Bisherige Sets change.
+	Shipment bool
 }
 
 // defaultStatePath keeps one state file per account. The readable part is
@@ -203,20 +209,34 @@ func summarize(changes []loanChange) (title, description string) {
 	for i, c := range changes {
 		lines[i] = c.Line
 	}
-	if len(changes) == 1 {
+	shipments := 0
+	for _, c := range changes {
+		if c.Shipment {
+			shipments++
+		}
+	}
+	switch {
+	case len(changes) == 1:
 		title = "Bauduu: " + changes[0].Title
-	} else {
+	case shipments == 0:
 		title = fmt.Sprintf("Bauduu: %d Änderungen bei Bisherige Sets", len(changes))
+	case shipments == len(changes):
+		title = fmt.Sprintf("Bauduu: %d Neuigkeiten zur Sendung", len(changes))
+	default:
+		title = fmt.Sprintf("Bauduu: %d Änderungen", len(changes))
 	}
 	return title, strings.Join(lines, "\n")
 }
 
 type watchOptions struct {
-	notify    string
-	statePath string
-	test      bool
-	dryRun    bool
-	verbose   bool
+	notify     string
+	statePath  string
+	test       bool
+	dryRun     bool
+	verbose    bool
+	zip        string
+	noMail     bool
+	noTracking bool
 }
 
 func newWatchCmd(opts *options) *cobra.Command {
@@ -241,6 +261,13 @@ as one argument:
   bauduu watch --notify 'notify -t {{title}} -d {{description}}'
   bauduu watch --notify 'curl -s -H "Title: {{title}}" -d {{description}} ntfy.sh/topic'
 
+While a set is at home ("Ausgeliehen") without a known tracking code, watch
+searches the mailbox configured with 'bauduu setup mail' for Bauduu's
+shipping mail and reports the tracking code. It then queries DHL on every run
+and reports each new status until the parcel is delivered. With a postal code
+('bauduu setup dhl' or --zip) DHL shows the full history. Mailbox or DHL
+failures are printed as warnings; the rest of the run continues.
+
 The state is saved only after the notification succeeded, so a failed
 command is retried on the next run.`,
 		Args: cobra.NoArgs,
@@ -254,6 +281,9 @@ command is retried on the next run.`,
 	f.BoolVar(&w.test, "test", false, "send a test notification through --notify and exit")
 	f.BoolVar(&w.dryRun, "dry-run", false, "print the rendered notify command instead of running it; keep the state unchanged")
 	f.BoolVarP(&w.verbose, "verbose", "v", false, "also report when nothing changed")
+	f.StringVar(&w.zip, "zip", "", "postal code for DHL details (default $BAUDUU_DHL_ZIP or dhl_zip from the config)")
+	f.BoolVar(&w.noMail, "no-mail", false, "do not search the mailbox for tracking codes")
+	f.BoolVar(&w.noTracking, "no-tracking", false, "do not query DHL")
 	return cmd
 }
 
@@ -294,6 +324,14 @@ func runWatch(ctx context.Context, out io.Writer, opts *options, w *watchOptions
 	if err != nil {
 		return err
 	}
+	var verbose io.Writer
+	if w.verbose {
+		verbose = out
+	}
+	env, err := newTrackEnv(opts, w.zip, w.noMail, w.noTracking, verbose)
+	if err != nil {
+		return err
+	}
 	statePath := w.statePath
 	if statePath == "" {
 		if statePath = defaultStatePath(creds.User); statePath == "" {
@@ -330,9 +368,12 @@ func runWatch(ctx context.Context, out io.Writer, opts *options, w *watchOptions
 		return nil
 	}
 	changes := diffLoans(prev.Loans, loans, now)
+	u := updateShipments(ctx, env, loans, prev.Shipments, prev.MailSeen, now)
+	next.Shipments, next.MailSeen = u.Shipments, u.MailSeen
+	changes = append(changes, u.Changes...)
 	if len(changes) == 0 {
 		if w.verbose {
-			fmt.Fprintf(out, "Keine Änderungen (%d Einträge, letzter Lauf %s)\n", len(loans), prev.Checked.Local().Format(time.DateTime))
+			fmt.Fprintf(out, "Keine Änderungen (%d Einträge, %d Sendungen, letzter Lauf %s)\n", len(loans), len(next.Shipments), prev.Checked.Local().Format(time.DateTime))
 		}
 		if w.dryRun {
 			return nil
