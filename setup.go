@@ -147,17 +147,41 @@ func (p *prompter) secret(label string, hasCurrent bool) (string, error) {
 }
 
 func newSetupCmd(opts *options) *cobra.Command {
+	mf := &setupMailFlags{}
+	df := &setupDHLFlags{}
 	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Configure the mailbox for shipping mails and the DHL postal code",
 		Long: `setup stores settings in the config file (mode 0600), next to the bauduu
 login. Existing values are offered as defaults; other entries stay as they are.
 
+  bauduu setup         both, the mailbox first, then the postal code
   bauduu setup mail    mailbox (IMAP or POP3) with Bauduu's shipping mails
-  bauduu setup dhl     postal code (PLZ) for full DHL tracking details`,
+  bauduu setup dhl     postal code (PLZ) for full DHL tracking details
+
+Without a subcommand an empty mail server or postal code skips that part.
+The flags of setup mail and --zip preset the answers.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			out := cmd.OutOrStdout()
+			if err := runSetupMail(cmd.Context(), out, opts, mf, cmd.Flags().Changed, true); err != nil {
+				return err
+			}
+			return runSetupDHL(cmd.Context(), out, opts, df, true)
+		},
 	}
+	mf.register(cmd)
+	cmd.Flags().StringVar(&df.zip, "zip", "", "postal code of the delivery address (5 digits)")
 	cmd.AddCommand(newSetupMailCmd(opts), newSetupDHLCmd(opts))
 	return cmd
+}
+
+// skipHint marks a prompt whose empty answer skips that part of setup.
+func skipHint(label, def string, optional bool) string {
+	if optional && def == "" {
+		return label + " (leer: überspringen)"
+	}
+	return label
 }
 
 type setupMailFlags struct {
@@ -182,9 +206,14 @@ IMAP messages stay unread, POP3 messages are never deleted.
   bauduu setup mail --protocol imap --host imap.example.com --mail-user me@example.com`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runSetupMail(cmd.Context(), cmd.OutOrStdout(), opts, f, cmd.Flags().Changed)
+			return runSetupMail(cmd.Context(), cmd.OutOrStdout(), opts, f, cmd.Flags().Changed, false)
 		},
 	}
+	f.register(cmd)
+	return cmd
+}
+
+func (f *setupMailFlags) register(cmd *cobra.Command) {
 	fl := cmd.Flags()
 	fl.StringVar(&f.protocol, "protocol", "", "imap or pop3 (default imap)")
 	fl.StringVar(&f.host, "host", "", "mail server host name")
@@ -195,10 +224,11 @@ IMAP messages stay unread, POP3 messages are never deleted.
 	fl.StringVar(&f.from, "from", "", "sender of the shipping mails (default "+bauduu.ShippingSender+")")
 	fl.BoolVar(&f.noTest, "no-test", false, "save without testing the connection")
 	fl.IntVar(&f.days, "days", 60, "days of mail to search in the test")
-	return cmd
 }
 
-func runSetupMail(ctx context.Context, out io.Writer, opts *options, f *setupMailFlags, changed func(string) bool) error {
+// runSetupMail asks for the mailbox settings, tests and saves them. With
+// optional set, an empty server skips the mailbox.
+func runSetupMail(ctx context.Context, out io.Writer, opts *options, f *setupMailFlags, changed func(string) bool, optional bool) error {
 	cur, err := readConfig(opts.configPath)
 	if err != nil {
 		return err
@@ -217,8 +247,13 @@ func runSetupMail(ctx context.Context, out io.Writer, opts *options, f *setupMai
 	if s.Protocol, err = p.ask("Protokoll (imap/pop3)", pick("protocol", f.protocol, keyMailProtocol, mail.IMAP)); err != nil {
 		return err
 	}
-	if s.Host, err = p.ask("Server", pick("host", f.host, keyMailHost, "")); err != nil {
+	host := pick("host", f.host, keyMailHost, "")
+	if s.Host, err = p.ask(skipHint("Server", host, optional), host); err != nil {
 		return err
+	}
+	if s.Host = strings.TrimSpace(s.Host); s.Host == "" && optional {
+		fmt.Fprintln(out, "Kein Mailserver angegeben, Postfach übersprungen")
+		return nil
 	}
 	if s.Security, err = p.ask("Verschlüsselung (tls/starttls/none)", pick("security", f.security, keyMailSecurity, mail.SecurityTLS)); err != nil {
 		return err
@@ -312,9 +347,13 @@ func mailboxName(s mailSettings) string {
 	return s.Mailbox
 }
 
+type setupDHLFlags struct {
+	zip, testCode string
+	remove        bool
+}
+
 func newSetupDHLCmd(opts *options) *cobra.Command {
-	var zip, testCode string
-	var remove bool
+	f := &setupDHLFlags{}
 	cmd := &cobra.Command{
 		Use:   "dhl",
 		Short: "Store the postal code (PLZ) that unlocks full DHL tracking details",
@@ -327,52 +366,63 @@ watch override it.
   bauduu setup dhl --zip 44579 --test 00340434698381831612`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			out := cmd.OutOrStdout()
-			if remove {
-				if err := updateConfig(opts.configPath, "", []kv{{keyDHLZip, ""}}); err != nil {
-					return err
-				}
-				fmt.Fprintln(out, "Postleitzahl entfernt")
-				return nil
-			}
-			cur, err := readConfig(opts.configPath)
-			if err != nil {
-				return err
-			}
-			if zip == "" {
-				if zip, err = newPrompter().ask("Postleitzahl der Lieferadresse", cur[keyDHLZip]); err != nil {
-					return err
-				}
-			}
-			zip = strings.TrimSpace(zip)
-			if !validZip(zip) {
-				return fmt.Errorf("invalid postal code %q (want 5 digits)", zip)
-			}
-			if testCode != "" {
-				c, err := dhl.New(opts.dhlURL, opts.timeout)
-				if err != nil {
-					return err
-				}
-				s, err := c.Track(cmd.Context(), testCode, zip)
-				if err != nil {
-					return fmt.Errorf("%w (nothing saved)", err)
-				}
-				fmt.Fprintf(out, "DHL %s: %s\n", s.Code, orDash(s.Status))
-				if !s.Complete {
-					fmt.Fprintln(out, "Hinweis: DHL liefert noch keine Details zu dieser Sendung.")
-				}
-			}
-			if err := updateConfig(opts.configPath, "# bauduu-cli settings", []kv{{keyDHLZip, zip}}); err != nil {
-				return fmt.Errorf("save config: %w", err)
-			}
-			fmt.Fprintf(out, "Postleitzahl %s gespeichert in %s\n", zip, opts.configPath)
-			return nil
+			return runSetupDHL(cmd.Context(), cmd.OutOrStdout(), opts, f, false)
 		},
 	}
-	cmd.Flags().StringVar(&zip, "zip", "", "postal code of the delivery address (5 digits)")
-	cmd.Flags().StringVar(&testCode, "test", "", "query this tracking code with the postal code before saving")
-	cmd.Flags().BoolVar(&remove, "remove", false, "remove the stored postal code")
+	cmd.Flags().StringVar(&f.zip, "zip", "", "postal code of the delivery address (5 digits)")
+	cmd.Flags().StringVar(&f.testCode, "test", "", "query this tracking code with the postal code before saving")
+	cmd.Flags().BoolVar(&f.remove, "remove", false, "remove the stored postal code")
 	return cmd
+}
+
+// runSetupDHL asks for the postal code and saves it. With optional set, an
+// empty postal code skips it.
+func runSetupDHL(ctx context.Context, out io.Writer, opts *options, f *setupDHLFlags, optional bool) error {
+	if f.remove {
+		if err := updateConfig(opts.configPath, "", []kv{{keyDHLZip, ""}}); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "Postleitzahl entfernt")
+		return nil
+	}
+	cur, err := readConfig(opts.configPath)
+	if err != nil {
+		return err
+	}
+	zip := f.zip
+	if zip == "" {
+		def := cur[keyDHLZip]
+		if zip, err = newPrompter().ask(skipHint("Postleitzahl der Lieferadresse", def, optional), def); err != nil {
+			return err
+		}
+	}
+	zip = strings.TrimSpace(zip)
+	if zip == "" && optional {
+		fmt.Fprintln(out, "Keine Postleitzahl angegeben, DHL-Details übersprungen")
+		return nil
+	}
+	if !validZip(zip) {
+		return fmt.Errorf("invalid postal code %q (want 5 digits)", zip)
+	}
+	if f.testCode != "" {
+		c, err := dhl.New(opts.dhlURL, opts.timeout)
+		if err != nil {
+			return err
+		}
+		s, err := c.Track(ctx, f.testCode, zip)
+		if err != nil {
+			return fmt.Errorf("%w (nothing saved)", err)
+		}
+		fmt.Fprintf(out, "DHL %s: %s\n", s.Code, orDash(s.Status))
+		if !s.Complete {
+			fmt.Fprintln(out, "Hinweis: DHL liefert noch keine Details zu dieser Sendung.")
+		}
+	}
+	if err := updateConfig(opts.configPath, "# bauduu-cli settings", []kv{{keyDHLZip, zip}}); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	fmt.Fprintf(out, "Postleitzahl %s gespeichert in %s\n", zip, opts.configPath)
+	return nil
 }
 
 var errNoMail = errors.New("no mailbox configured (run 'bauduu setup mail')")

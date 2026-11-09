@@ -121,6 +121,15 @@ follows the parcel on dhl.de.
    `--zip` on `track`/`watch` and `BAUDUU_DHL_ZIP` override it. Without a
    postal code only DHL's public summary (status, progress) is available.
 
+`bauduu setup` without a subcommand does both in a row, the mailbox first.
+An empty mail server or postal code skips that part; the `setup mail` flags
+and `--zip` preset the answers:
+
+```sh
+bauduu setup
+bauduu setup --host imap.example.com --mail-user me@example.com --zip 44579
+```
+
 Then:
 
 ```sh

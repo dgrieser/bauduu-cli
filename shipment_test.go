@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -486,14 +487,14 @@ func TestSetupMailNonInteractive(t *testing.T) {
 
 	t.Setenv("BAUDUU_MAIL_PASSWORD", "wrong")
 	var out bytes.Buffer
-	if err := runSetupMail(context.Background(), &out, opts, f, changed); err == nil {
+	if err := runSetupMail(context.Background(), &out, opts, f, changed, false); err == nil {
 		t.Fatal("wrong password must fail")
 	}
 	if cfg, _ := readConfig(path); cfg[keyMailHost] != "" {
 		t.Error("failed test must not save")
 	}
 	t.Setenv("BAUDUU_MAIL_PASSWORD", "secret")
-	if err := runSetupMail(context.Background(), &out, opts, f, changed); err != nil {
+	if err := runSetupMail(context.Background(), &out, opts, f, changed, false); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "1 Mails von bauduu@brickcoast.de in den letzten 3650 Tagen, 1 mit Trackingnummer") {
@@ -526,5 +527,43 @@ func TestNewTrackEnvLenient(t *testing.T) {
 	}
 	if env.mail != nil || env.zip != "" || env.dhl == nil {
 		t.Errorf("lenient env = %+v", env)
+	}
+}
+
+func TestSetupBoth(t *testing.T) {
+	ms := testMailbox(t)
+	path := filepath.Join(t.TempDir(), "config")
+	t.Setenv("BAUDUU_MAIL_PASSWORD", "secret")
+	run := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		root := newRootCmd()
+		root.SetArgs(append([]string{"--config", path, "setup"}, args...))
+		root.SetOut(&out)
+		root.SetErr(io.Discard)
+		err := root.Execute()
+		return out.String(), err
+	}
+	// Nothing given: both parts are skipped, nothing is saved.
+	if out, err := run(); err != nil || !strings.Contains(out, "Postfach übersprungen") || !strings.Contains(out, "DHL-Details übersprungen") {
+		t.Fatalf("empty = %q, %v", out, err)
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("config written without settings")
+	}
+	out, err := run("--host", ms.Host, "--port", strconv.Itoa(ms.Port), "--security", "none", "--mail-user", "erika", "--days", "3650", "--zip", "44579")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := readConfig(path)
+	if cfg[keyMailHost] != ms.Host || cfg[keyMailPassword] != "secret" || cfg[keyDHLZip] != "44579" {
+		t.Errorf("config = %v\n%s", cfg, out)
+	}
+	// A failed mailbox test stops before the postal code.
+	t.Setenv("BAUDUU_MAIL_PASSWORD", "wrong")
+	if _, err := run("--zip", "12345"); err == nil {
+		t.Error("wrong mail password accepted")
+	}
+	if cfg, _ := readConfig(path); cfg[keyDHLZip] != "44579" {
+		t.Errorf("zip changed after failed mail setup: %v", cfg)
 	}
 }
