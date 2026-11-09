@@ -52,6 +52,8 @@ type table struct {
 	Columns []column
 	Rows    []row
 	Footer  []string
+	// HideEmpty prints only title and footer when there are no rows.
+	HideEmpty bool
 }
 
 func (t *table) add(cells ...string) *row {
@@ -187,6 +189,12 @@ func (t *table) render(out io.Writer, color bool, maxWidth int) {
 	}
 	if t.Title != "" {
 		fmt.Fprintln(out, style(t.Title, ansiBold+ansiCyan))
+	}
+	if len(t.Rows) == 0 && t.HideEmpty {
+		for _, f := range t.Footer {
+			fmt.Fprintln(out, style(f, ansiDim))
+		}
+		return
 	}
 	if len(t.Rows) == 0 {
 		// Keep the frame intact for an empty table.

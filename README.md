@@ -11,12 +11,16 @@ customer area. It logs in and prints the account sections as tables (or JSON):
 | `buchungen`    | Deine Buchung                      | Bookings/subscriptions with price and period                    |
 | `daten`        | Deine Daten                        | Account, customer, delivery and SEPA data (IBAN masked)         |
 | `all` / none   | everything                         | All of the above                                                |
-| `watch`        | Bisherige Sets                     | Detect changes since the last run and notify (for cron)         |
+| `track`        | DHL Sendungsverfolgung             | Parcel status and history of the sets at home                   |
+| `mail`         | your mailbox                       | Bauduu's shipping mails and their tracking codes                |
+| `setup`        | –                                  | Configure mailbox (`setup mail`) and DHL API key (`setup dhl`)  |
+| `watch`        | Bisherige Sets + DHL               | Detect changes since the last run and notify (for cron)         |
 
 German aliases and English aliases work too (`wishlist`, `history`, `returns`,
 `subscriptions`, `profile`, …).
 
-The tool only reads. It never submits the Retoure, Pause or profile forms.
+The tool only reads. It never submits the Retoure, Pause or profile forms,
+never marks mails as read and never deletes them.
 
 ## Install
 
@@ -51,6 +55,10 @@ Resolved in this order:
 
 The stored password is used only for the stored user.
 
+The same file holds the mailbox and DHL settings written by `bauduu setup`
+(see below). Every `setup`/`login --save` only replaces its own keys and keeps
+the other lines.
+
 ## Usage
 
 ```sh
@@ -79,11 +87,146 @@ Retouren (6)
 Aktuell zu Hause: Riesenrad 3in1 (31119), versendet 2026-10-14, seit 6 Tagen
 ```
 
+## Shipping mails and DHL tracking
+
+When Bauduu ships a set, it mails the DHL tracking code from
+`bauduu@brickcoast.de` ("Sie können den Sendungsverlauf verfolgen via DHL:
+Trackingcode: 00340434698381831612"). The site itself only shows the set as
+"Ausgeliehen" until the set is back, so bauduu-cli reads that mail and
+follows the parcel on dhl.de.
+
+1. Mailbox access (IMAP or POP3, read-only: IMAP mails stay unread, POP3
+   mails are never deleted). `setup mail` asks for server, port, encryption,
+   login and folder, tests the login, counts the shipping mails and saves:
+
+   ```sh
+   bauduu setup mail
+   bauduu setup mail --protocol imap --host imap.example.com --mail-user me@example.com
+   bauduu setup mail --protocol pop3 --host pop.example.com --security starttls --mail-user me
+   ```
+
+   Flags preset the answers (`--protocol imap|pop3`, `--host`, `--port`,
+   `--security tls|starttls|none`, `--mail-user`, `--mailbox`, `--from`,
+   `--no-test`). The password is prompted (hidden) or taken from
+   `BAUDUU_MAIL_PASSWORD`, which also overrides the stored one at runtime.
+
+2. DHL tracking works without setup: dhl.de's public tracking gives the
+   status, progress and history, product, destination country and who took
+   the parcel. The places of the events and the recipient's name need the
+   recipient's postal code, and dhl.de only answers that query for
+   browsers. DHL's official API gives them: register for free at
+   [developer.dhl.com](https://developer.dhl.com), create an app with the API
+   **Shipment Tracking - Unified** (not "Unified Push"; only the API key is
+   needed, not the secret) and store its key together with the postal code
+   (Postleitzahl), without which the API names no places either:
+
+   ```sh
+   bauduu setup dhl                                    # asks for key and postal code
+   bauduu setup dhl --api-key KEY --zip 44579 --test 00340434698381831612
+   bauduu setup dhl --api-key ""                       # remove the key
+   ```
+
+   setup checks the key before saving it. With a key, `track` and `watch`
+   ask the API and fall back to dhl.de when it fails (with a warning, unless
+   the API just does not know the code). The free plan allows 250 queries a
+   day and one every five seconds; bauduu-cli waits between queries.
+   `BAUDUU_DHL_API_KEY`, `BAUDUU_DHL_ZIP` and `--zip` on `track`/`watch`
+   override the stored values.
+
+`bauduu setup` without a subcommand does both in a row, the mailbox first.
+An empty mail server skips the mailbox, no API key and postal code skip DHL;
+the flags of `setup mail` and `setup dhl` (`--api-key`, `--zip`) preset the
+answers:
+
+```sh
+bauduu setup
+bauduu setup --host imap.example.com --mail-user me@example.com --api-key KEY --zip 44579
+```
+
+Then:
+
+```sh
+bauduu mail                          # shipping mails of the last 90 days
+bauduu track                         # sets at home: tracking code from the mail, DHL status
+bauduu track 00340434698381831612    # any DHL tracking code
+bauduu track -o json
+```
+
+With an API key:
+
+```
+Riesenrad 3in1 (31119) · DHL 00340434698381831612
+┌──────────────────┬───────────┬─────────────────────────────────────────────────────┐
+│ Zeit             │ Ort       │ Status                                              │
+├──────────────────┼───────────┼─────────────────────────────────────────────────────┤
+│ 2026-11-06 16:41 │           │ Die Sendung wurde zugestellt.                       │
+│ 2026-11-06 09:57 │           │ Die Sendung wurde in das Zustellfahrzeug geladen.   │
+│                  │           │ Die Zustellung erfolgt voraussichtlich heute.       │
+│ 2026-11-06 00:32 │ Bielefeld │ Die Sendung ist in der Region des Empfängers        │
+│                  │           │ angekommen und wird im nächsten Schritt zur         │
+│                  │           │ Zustellbasis transportiert.                         │
+│ 2026-11-05 18:23 │           │ Die Sendung wurde elektronisch angekündigt. Sobald  │
+│                  │           │ die Sendung von uns bearbeitet wurde, erhalten Sie  │
+│                  │           │ weitere Informationen.                              │
+│ 2026-11-05 16:31 │ Bochum    │ Die Sendung wurde von DHL bearbeitet und wird für   │
+│                  │           │ den Weitertransport in die Region des Empfängers    │
+│                  │           │ vorbereitet.                                        │
+└──────────────────┴───────────┴─────────────────────────────────────────────────────┘
+Die Sendung wurde zugestellt. (2026-11-06 16:41)
+Produkt: DHL PAKET
+Adressiert an: Erika Mustermann, Deutschland
+https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?piececode=00340434698381831612
+```
+
+A mail is linked to the set whose shipping date ("Versendet") is closest to
+the mail date, at most 5 days apart. Config keys: `mail_protocol`,
+`mail_host`, `mail_port`, `mail_security`, `mail_user`, `mail_password`,
+`mail_mailbox`, `mail_from`, `dhl_api_key` and `dhl_zip`.
+
+Without an API key the DHL data comes from the JSON endpoints behind dhl.de's
+tracking page (`/int-verfolgen/data/…`), which are undocumented and protected
+against bots; DHL may refuse some networks (e.g. data centers) or rate-limit
+queries.
+
 ## Watch for changes (cron)
 
 `bauduu watch` compares Bisherige Sets with the previous run and reports
 newly shipped sets, booked returns, status and bonus brick changes. The first
 run stores a baseline. Without changes it prints nothing, so cron stays quiet.
+
+With a mailbox configured, watch also follows the parcels: while a set is
+"Ausgeliehen" without a known tracking code, it searches the mailbox for
+Bauduu's shipping mail and notifies as soon as the code is known
+(`Bauduu: Trackingnummer für Riesenrad 3in1`). From then on every run queries
+DHL and reports each new status or history event until the parcel is
+delivered. The title says where the parcel is (`Bauduu: Sendung Riesenrad
+3in1 unterwegs (Bielefeld)`, `… angekündigt`, `… in Zustellung`,
+`Bauduu: Zugestellt: Riesenrad 3in1`), the description has the full DHL
+text:
+
+```
+Title:       Bauduu: Sendung Riesenrad 3in1 unterwegs (Bielefeld)
+Description: DHL 00340434698381831612 (Riesenrad 3in1): Die Sendung ist in der Region des Empfängers angekommen und wird im nächsten Schritt zur Zustellbasis transportiert. (Bielefeld, 06.11. 00:32)
+```
+
+Several events since the last run get one line each:
+
+```
+Title:       Bauduu: Zugestellt: Riesenrad 3in1
+Description: DHL 00340434698381831612 (Riesenrad 3in1):
+             Die Sendung wurde in das Zustellfahrzeug geladen. Die Zustellung erfolgt voraussichtlich heute. (06.11. 09:57)
+             Die Sendung wurde zugestellt. (06.11. 16:41)
+```
+
+News about one set in the same run shares a title, e.g. when the set
+ships, its mail arrives and DHL reports the first status:
+`Bauduu: Riesenrad 3in1 unterwegs (Bochum), Trackingnummer da`. The mailbox is not touched while every set at home has its code, and
+DHL is not queried after delivery (unless the last answer came from dhl.de
+because the API failed). `--no-mail`, `--no-tracking` and `--zip` adjust
+this. Mailbox or DHL failures, and broken mail or DHL settings, are printed
+as warnings on stderr; the other checks still run and the failed one is
+retried next time. Switching between the API and dhl.de reports only events
+after the last known one, as both word the history differently.
 
 `--notify` takes a `/bin/sh` command template. `{{title}}` and
 `{{description}}` (alias `{{desc}}`) become quoted references to the
@@ -119,9 +262,13 @@ Description: Retour verbucht: Arktis Basislager (60036) am 2026-06-09 nach 42 Ta
 ```
 
 Several changes in one run are combined: the title then reads
-`Bauduu: 3 Änderungen bei Bisherige Sets`, with one description line each.
+`Bauduu: 3 Änderungen bei Bisherige Sets` (or `… Neuigkeiten zur Sendung`,
+`… Änderungen` when mixed), with one description line each (several for
+the events of a parcel). Shipping news about a single set keep a title of
+their own, see above.
 
-The state lives in `$XDG_STATE_HOME/bauduu/sets-<user>-<hash>.json` (default
+The state (sets, tracking codes, last DHL status) lives in
+`$XDG_STATE_HOME/bauduu/sets-<user>-<hash>.json` (default
 `~/.local/state/...`, override with `--state`); a state file of another
 account is refused. It is saved only after the
 notify command succeeded, so a failed notification is retried next run.

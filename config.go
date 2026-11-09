@@ -66,18 +66,78 @@ func readConfig(path string) (map[string]string, error) {
 }
 
 func writeConfig(path string, c credentials) error {
+	return updateConfig(path, "# bauduu-cli settings", []kv{{"user", c.User}, {"password", c.Password}})
+}
+
+// kv is one config entry; a slice keeps the order of new keys.
+type kv struct{ Key, Value string }
+
+// updateConfig sets keys in the config file and keeps every other line,
+// comments included. Existing keys are replaced in place, new ones appended.
+// An empty value removes the key. header starts a new file.
+func updateConfig(path, header string, set []kv) error {
 	if path == "" {
 		return errors.New("no config path available")
 	}
+	old, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	// Validate the current file, so a broken line is reported, not copied.
+	if _, err := readConfig(path); err != nil {
+		return err
+	}
+	pending := make(map[string]string, len(set))
+	for _, e := range set {
+		pending[strings.ToLower(e.Key)] = e.Value
+	}
+	// written marks keys already set; later duplicates of them are dropped,
+	// since readConfig would let the last occurrence win.
+	written := make(map[string]bool, len(set))
+	line := func(key, value string) string {
+		// Quote every value so any character, spaces at the edges included,
+		// survives the round trip through readConfig.
+		return key + " = " + strconv.Quote(value)
+	}
+	var lines []string
+	if len(old) == 0 && header != "" {
+		lines = append(lines, header)
+	}
+	for _, l := range strings.Split(strings.TrimRight(string(old), "\n"), "\n") {
+		if len(old) == 0 {
+			break
+		}
+		t := strings.TrimSpace(l)
+		key, _, ok := strings.Cut(t, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		if ok && !strings.HasPrefix(t, "#") {
+			if v, found := pending[key]; found {
+				if v != "" && !written[key] {
+					lines = append(lines, line(key, v))
+				}
+				written[key] = true
+				continue
+			}
+		}
+		lines = append(lines, l)
+	}
+	for _, e := range set {
+		k := strings.ToLower(e.Key)
+		if v := pending[k]; v != "" && !written[k] {
+			lines = append(lines, line(k, v))
+		}
+		written[k] = true
+	}
+	return writeFilePrivate(path, strings.Join(lines, "\n")+"\n")
+}
+
+// writeFilePrivate writes a fresh 0600 file (CreateTemp's mode) and renames
+// it into place, so secrets never sit in a file with looser permissions.
+func writeFilePrivate(path, content string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	// Quote both values so any character, spaces at the edges included,
-	// survives the round trip through readConfig.
-	content := fmt.Sprintf("# bauduu-cli credentials\nuser = %s\npassword = %s\n", strconv.Quote(c.User), strconv.Quote(c.Password))
-	// Write a fresh 0600 file (CreateTemp's mode) and rename it into place, so
-	// the password never sits in an existing file with looser permissions.
 	f, err := os.CreateTemp(dir, ".config-*")
 	if err != nil {
 		return err

@@ -1,8 +1,11 @@
-# bauduu: check "Bisherige Sets" every 30 minutes and notify on changes.
+# bauduu: check "Bisherige Sets" every 30 minutes and notify on changes;
+# with a mailbox configured also on the tracking code and each DHL status.
 # Install with `crontab -e` and paste the lines you need.
 #
 # Before the first cron run:
 #   bauduu login --save        # store credentials (~/.config/bauduu/config, 0600)
+#   bauduu setup mail          # optional: mailbox with Bauduu's shipping mails
+#   bauduu setup dhl           # optional: postal code for full DHL tracking
 #   bauduu watch               # store the current list as the baseline
 #   bauduu watch --test --notify '<your command>'   # check the notifier
 #

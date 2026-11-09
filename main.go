@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/dgrieser/bauduu-cli/internal/bauduu"
+	"github.com/dgrieser/bauduu-cli/internal/dhl"
 )
 
 // Set via -ldflags by goreleaser and the Makefile.
@@ -30,6 +30,8 @@ type options struct {
 	user       string
 	configPath string
 	baseURL    string
+	dhlURL     string
+	dhlAPIURL  string
 	output     string
 	timeout    time.Duration
 	noDetails  bool
@@ -81,7 +83,10 @@ Ausleihliste, bisherige Sets, Retouren, Buchungen and Deine Daten.
 Without a subcommand every section is printed.
 
 Credentials come from --user, BAUDUU_USER/BAUDUU_PASSWORD, the config file
-(see 'bauduu login --save'), or an interactive prompt.`,
+(see 'bauduu login --save'), or an interactive prompt.
+
+'bauduu track' follows the DHL parcel of the sets at home; the tracking codes
+come from Bauduu's shipping mails (see 'bauduu setup mail' and 'bauduu setup dhl').`,
 		Version:       versionString(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -99,7 +104,11 @@ Credentials come from --user, BAUDUU_USER/BAUDUU_PASSWORD, the config file
 	f.BoolVar(&opts.noDetails, "no-details", false, "skip product pages (article number, theme, package) for the Ausleihliste")
 	f.BoolVar(&opts.reveal, "reveal", false, "show sensitive values such as the IBAN unmasked")
 	f.BoolVar(&opts.noColor, "no-color", false, "disable colors (also via NO_COLOR)")
+	f.StringVar(&opts.dhlURL, "dhl-url", dhl.DefaultBaseURL, "DHL tracking base URL")
 	_ = f.MarkHidden("base-url")
+	f.StringVar(&opts.dhlAPIURL, "dhl-api-url", dhl.DefaultAPIURL, "DHL API base URL")
+	_ = f.MarkHidden("dhl-url")
+	_ = f.MarkHidden("dhl-api-url")
 
 	sectionCmd := func(use string, aliases []string, short string, secs ...section) *cobra.Command {
 		return &cobra.Command{
@@ -119,7 +128,10 @@ Credentials come from --user, BAUDUU_USER/BAUDUU_PASSWORD, the config file
 		sectionCmd("retouren", []string{"retoure", "returns"}, "Show returned sets and the set currently at home", secReturns),
 		sectionCmd("buchungen", []string{"buchung", "abo", "subscriptions"}, "Show bookings/subscriptions", secSubscriptions),
 		sectionCmd("daten", []string{"deine-daten", "profile", "me"}, "Show Deine Daten (account and customer data)", secProfile),
+		newTrackCmd(opts),
+		newMailCmd(opts),
 		newLoginCmd(opts),
+		newSetupCmd(opts),
 		newWatchCmd(opts),
 	)
 	return root
@@ -308,10 +320,7 @@ func writeJSON(out io.Writer, a *account, secs []section, reveal bool) error {
 			"profile":       profile,
 		}
 	}
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	enc.SetEscapeHTML(false)
-	return enc.Encode(v)
+	return encodeJSON(out, v)
 }
 
 // nonNil makes empty lists encode as [] instead of null.
