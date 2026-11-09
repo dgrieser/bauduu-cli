@@ -30,9 +30,9 @@ type trackedShipment struct {
 	// Tracking is the last seen DHL state; nil before the first query.
 	Tracking *dhl.Shipment `json:"tracking,omitempty"`
 	Checked  time.Time     `json:"checked,omitzero"`
-	// DetailsFailed means Tracking is only the public summary because the
-	// details request failed; it is retried even after delivery.
-	DetailsFailed bool `json:"details_failed,omitempty"`
+	// Fallback means Tracking comes from dhl.de because the DHL API failed;
+	// the API is asked again even after delivery.
+	Fallback bool `json:"fallback,omitempty"`
 }
 
 // trackable reports whether the carrier's tracking can be queried.
@@ -42,7 +42,7 @@ func (s *trackedShipment) trackable() bool {
 
 // done means there is nothing left to watch.
 func (s *trackedShipment) done() bool {
-	return s.Tracking != nil && s.Tracking.Delivered && !s.DetailsFailed
+	return s.Tracking != nil && s.Tracking.Delivered && !s.Fallback
 }
 
 // noticeMail is one mail from the shipping sender; Notice is nil when it
@@ -251,30 +251,61 @@ func updateShipments(ctx context.Context, env *trackEnv, loans []bauduu.Loan, pr
 				continue
 			}
 		}
-		keepHistory(s.Tracking, cur)
 		u.Changes = append(u.Changes, trackingChanges(s, s.Tracking, cur)...)
 		s.Tracking = cur
-		s.DetailsFailed = err != nil
+		s.Fallback = err != nil
 		s.Checked = now.UTC().Truncate(time.Second)
 	}
 	return u
 }
 
-// keepHistory carries the known history over to cur when cur is only DHL's
-// public summary, for example because the details request failed. Otherwise
-// the next full answer would be compared against the summary and the events
-// in between would never be reported.
-func keepHistory(old, cur *dhl.Shipment) {
-	if old == nil || cur.NotFound != "" || len(cur.Events) >= len(old.Events) || (cur.Complete && !cur.ZipRequired) {
-		return
+// source is where s came from; state of older versions is from dhl.de.
+func source(s *dhl.Shipment) string {
+	if s.Source == "" {
+		return dhl.SourceWeb
 	}
-	cur.Events = old.Events
-	if cur.Status == "" {
-		cur.Status = old.Status
+	return s.Source
+}
+
+// newEvents are the events of cur that old lacks. From the same source,
+// that is everything past old's count, so late entries count too. The API
+// and dhl.de word and split events differently, so across sources only what
+// happened after old's last event is new.
+func newEvents(old, cur *dhl.Shipment) []dhl.Event {
+	if old == nil || len(old.Events) == 0 {
+		return nil
 	}
-	if cur.Status == old.Status && cur.StatusTime.IsZero() {
-		cur.StatusTime = old.StatusTime
+	if source(old) == source(cur) {
+		if len(cur.Events) > len(old.Events) {
+			return cur.Events[len(old.Events):]
+		}
+		return nil
 	}
+	var last time.Time
+	for _, e := range old.Events {
+		if e.Time.After(last) {
+			last = e.Time
+		}
+	}
+	var out []dhl.Event
+	for _, e := range cur.Events {
+		if e.Time.After(last) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// statusChanged reports a new status. Across sources the texts differ, so
+// only a later status time or the delivery counts.
+func statusChanged(old, cur *dhl.Shipment) bool {
+	if cur.Delivered && !old.Delivered {
+		return true
+	}
+	if source(old) != source(cur) {
+		return cur.StatusTime.After(old.StatusTime)
+	}
+	return old.Status != cur.Status || !old.StatusTime.Equal(cur.StatusTime)
 }
 
 // trackingChanges describes what is new in cur compared to old: every new
@@ -290,18 +321,15 @@ func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 		return "Sendung " + shortSet(s.Set) + ": " + status
 	}
 	var lines []string
-	oldEvents := 0
-	if old != nil {
-		oldEvents = len(old.Events)
-	}
+	fresh := newEvents(old, cur)
 	switch {
-	case oldEvents > 0 && len(cur.Events) > oldEvents:
-		for _, e := range cur.Events[oldEvents:] {
+	case len(fresh) > 0:
+		for _, e := range fresh {
 			lines = append(lines, eventLine(e))
 		}
-	case cur.Status != "" && (old == nil || old.Status != cur.Status || !old.StatusTime.Equal(cur.StatusTime) || cur.Delivered && !old.Delivered):
-		// Without a known history (first query, details just unlocked by
-		// the postal code) only the current status is news.
+	case cur.Status != "" && (old == nil || statusChanged(old, cur)):
+		// Without a known history (first query) only the current status
+		// is news.
 		line := cur.Status
 		if !cur.StatusTime.IsZero() {
 			line += " (" + cur.StatusTime.Local().Format("02.01. 15:04") + ")"
@@ -406,6 +434,15 @@ func newTrackEnv(opts *options, zipFlag string, noMail, noTracking, lenient bool
 		if env.dhl, err = dhl.New(opts.dhlURL, opts.timeout); err != nil {
 			return nil, err
 		}
+		env.dhl.APIURL = opts.dhlAPIURL
+		key, err := resolveAPIKey(opts.configPath)
+		switch {
+		case err != nil && lenient:
+			env.warn(fmt.Errorf("%w; DHL queried without API key", err))
+		case err != nil:
+			return nil, err
+		}
+		env.dhl.APIKey = key
 	}
 	return env, nil
 }
@@ -495,13 +532,15 @@ Without arguments it loads Bisherige Sets, takes every set at home
 shipping mail (see 'bauduu setup mail') and queries DHL. With arguments it
 queries the given tracking codes directly.
 
-DHL shows the full history only with the recipient's postal code: --zip,
-BAUDUU_DHL_ZIP or 'bauduu setup dhl'.`,
+Without setup, the data comes from dhl.de, which shows no places, sender or
+address. With a key for DHL's API ('bauduu setup dhl') track asks the API,
+which names them given the recipient's postal code (--zip, BAUDUU_DHL_ZIP or
+'bauduu setup dhl'), and falls back to dhl.de when the API fails.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runTrack(cmd.Context(), cmd.OutOrStdout(), opts, f, args)
 		},
 	}
-	cmd.Flags().StringVar(&f.zip, "zip", "", "postal code of the delivery address (default $BAUDUU_DHL_ZIP or dhl_zip from the config)")
+	cmd.Flags().StringVar(&f.zip, "zip", "", "postal code of the delivery address for the DHL API (default $BAUDUU_DHL_ZIP or dhl_zip from the config)")
 	cmd.Flags().BoolVar(&f.noMail, "no-mail", false, "do not search the mailbox for tracking codes")
 	return cmd
 }
@@ -529,7 +568,7 @@ func runTrack(ctx context.Context, out io.Writer, opts *options, f *trackFlags, 
 			}
 			s.Tracking = cur
 		}
-		if err := renderShipments(out, opts, shipments); err != nil {
+		if err := renderShipments(out, opts, shipments, env.dhl.APIKey == ""); err != nil {
 			return err
 		}
 		return errors.Join(errs...)
@@ -563,7 +602,7 @@ func runTrack(ctx context.Context, out io.Writer, opts *options, f *trackFlags, 
 	env.warn = func(err error) { failed = append(failed, err) }
 	u := updateShipments(ctx, env, loans, prev, seen, time.Now())
 	pending := pendingLoans(loans, u.Shipments)
-	if err := renderShipments(out, opts, u.Shipments); err != nil {
+	if err := renderShipments(out, opts, u.Shipments, env.dhl.APIKey == ""); err != nil {
 		return err
 	}
 	if opts.output == "table" {
@@ -581,7 +620,9 @@ func runTrack(ctx context.Context, out io.Writer, opts *options, f *trackFlags, 
 	return errors.Join(failed...)
 }
 
-func renderShipments(out io.Writer, opts *options, shipments []trackedShipment) error {
+// renderShipments prints the shipments; apiHint points to the DHL API for
+// the details dhl.de does not give out.
+func renderShipments(out io.Writer, opts *options, shipments []trackedShipment, apiHint bool) error {
 	if opts.output == "json" {
 		return encodeJSON(out, nonNil(shipments))
 	}
@@ -590,12 +631,12 @@ func renderShipments(out io.Writer, opts *options, shipments []trackedShipment) 
 		if i > 0 {
 			fmt.Fprintln(out)
 		}
-		shipmentTable(s).render(out, color, width)
+		shipmentTable(s, apiHint).render(out, color, width)
 	}
 	return nil
 }
 
-func shipmentTable(s trackedShipment) *table {
+func shipmentTable(s trackedShipment, apiHint bool) *table {
 	title := orDash(s.Carrier) + " " + s.Code
 	if s.Set != "" {
 		title = s.Set + " · " + title
@@ -603,13 +644,20 @@ func shipmentTable(s trackedShipment) *table {
 	t := &table{
 		Title:     title,
 		HideEmpty: true,
-		Columns: []column{
-			{Title: "Zeit"},
-			{Title: "Ort", Flex: true, MinWidth: 8, Drop: 1},
-			{Title: "Status", Flex: true, MinWidth: 20},
-		},
+		Columns:   []column{{Title: "Zeit"}},
 	}
 	tr := s.Tracking
+	// dhl.de gives no places; then the column is left out.
+	places := false
+	if tr != nil {
+		for _, e := range tr.Events {
+			places = places || e.Location != ""
+		}
+	}
+	if places {
+		t.Columns = append(t.Columns, column{Title: "Ort", Flex: true, MinWidth: 8, Drop: 1})
+	}
+	t.Columns = append(t.Columns, column{Title: "Status", Flex: true, MinWidth: 20})
 	if tr == nil {
 		if !s.trackable() {
 			t.Footer = append(t.Footer, "Sendungsverfolgung nur für DHL")
@@ -624,7 +672,11 @@ func shipmentTable(s trackedShipment) *table {
 		if !e.Time.IsZero() {
 			when = e.Time.Local().Format("2006-01-02 15:04")
 		}
-		r := t.add(when, e.Location, e.Status)
+		cells := []string{when, e.Location, e.Status}
+		if !places {
+			cells = []string{when, e.Status}
+		}
+		r := t.add(cells...)
 		if i < len(tr.Events)-1 {
 			r.Style = ansiDim
 		}
@@ -637,17 +689,41 @@ func shipmentTable(s trackedShipment) *table {
 		status += " (" + tr.StatusTime.Local().Format("2006-01-02 15:04") + ")"
 	}
 	t.Footer = append(t.Footer, status)
+	add := func(label, value string) {
+		if value != "" {
+			t.Footer = append(t.Footer, label+": "+value)
+		}
+	}
 	if w := deliveryWindow(tr); w != "" && !tr.Delivered {
-		t.Footer = append(t.Footer, "Zustellung voraussichtlich "+w)
+		add("Zustellung voraussichtlich", w)
 	}
-	if tr.NotFound != "" {
-		t.Footer = append(t.Footer, "DHL: "+tr.NotFound)
+	if !tr.Delivered {
+		add("Nächster Schritt", tr.NextStep)
 	}
-	if tr.ZipRequired || (!tr.Complete && tr.NotFound == "") {
-		t.Footer = append(t.Footer, "Details nur mit Postleitzahl: --zip oder 'bauduu setup dhl'")
+	add("Produkt", tr.Product)
+	add("Absender", tr.Sender)
+	if tr.Recipient != "" {
+		add("Adressiert an", strings.Join(nonEmpty(tr.Recipient, tr.Destination), ", "))
+	} else {
+		add("Ziel", tr.Destination)
+	}
+	add("Zugestellt an", tr.DeliveredTo)
+	add("DHL", tr.NotFound)
+	if apiHint && source(tr) == dhl.SourceWeb && tr.NotFound == "" {
+		t.Footer = append(t.Footer, "Orte, Absender und Adresse nur über die DHL-API: 'bauduu setup dhl'")
 	}
 	t.Footer = append(t.Footer, tr.URL)
 	return t
+}
+
+func nonEmpty(v ...string) []string {
+	var out []string
+	for _, s := range v {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func progressBar(n, total int) string {

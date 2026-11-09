@@ -264,9 +264,10 @@ as one argument:
 While a set is at home ("Ausgeliehen") without a known tracking code, watch
 searches the mailbox configured with 'bauduu setup mail' for Bauduu's
 shipping mail and reports the tracking code. It then queries DHL on every run
-and reports each new status until the parcel is delivered. With a postal code
-('bauduu setup dhl' or --zip) DHL shows the full history. Mailbox or DHL
-failures are printed as warnings; the rest of the run continues.
+and reports each new status until the parcel is delivered. With a key for
+DHL's API ('bauduu setup dhl') it asks the API, which also names the places,
+and falls back to dhl.de when the API fails. Mailbox or DHL failures are
+printed as warnings; the rest of the run continues.
 
 The state is saved only after the notification succeeded, so a failed
 command is retried on the next run.`,
@@ -281,7 +282,7 @@ command is retried on the next run.`,
 	f.BoolVar(&w.test, "test", false, "send a test notification through --notify and exit")
 	f.BoolVar(&w.dryRun, "dry-run", false, "print the rendered notify command instead of running it; keep the state unchanged")
 	f.BoolVarP(&w.verbose, "verbose", "v", false, "also report when nothing changed")
-	f.StringVar(&w.zip, "zip", "", "postal code for DHL details (default $BAUDUU_DHL_ZIP or dhl_zip from the config)")
+	f.StringVar(&w.zip, "zip", "", "postal code for the DHL API (default $BAUDUU_DHL_ZIP or dhl_zip from the config)")
 	f.BoolVar(&w.noMail, "no-mail", false, "do not search the mailbox for tracking codes")
 	f.BoolVar(&w.noTracking, "no-tracking", false, "do not query DHL")
 	return cmd

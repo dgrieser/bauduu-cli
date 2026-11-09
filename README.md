@@ -13,7 +13,7 @@ customer area. It logs in and prints the account sections as tables (or JSON):
 | `all` / none   | everything                         | All of the above                                                |
 | `track`        | DHL Sendungsverfolgung             | Parcel status and history of the sets at home                   |
 | `mail`         | your mailbox                       | Bauduu's shipping mails and their tracking codes                |
-| `setup`        | –                                  | Configure mailbox (`setup mail`) and DHL postal code (`setup dhl`) |
+| `setup`        | –                                  | Configure mailbox (`setup mail`) and DHL API key (`setup dhl`)  |
 | `watch`        | Bisherige Sets + DHL               | Detect changes since the last run and notify (for cron)         |
 
 German aliases and English aliases work too (`wishlist`, `history`, `returns`,
@@ -110,24 +110,36 @@ follows the parcel on dhl.de.
    `--no-test`). The password is prompted (hidden) or taken from
    `BAUDUU_MAIL_PASSWORD`, which also overrides the stored one at runtime.
 
-2. DHL shows the full history, the delivery time window and the location only
-   after entering the recipient's postal code (Postleitzahl). Store it once:
+2. DHL tracking works without setup: dhl.de's public tracking gives the
+   status, progress and history, product, destination country and who took
+   the parcel. The places of the events, the sender and the address need
+   the recipient's postal code, and dhl.de only answers that query for
+   browsers. DHL's official API gives them: register for free at
+   [developer.dhl.com](https://developer.dhl.com), create an app with the API
+   **Shipment Tracking - Unified** (not "Unified Push") and store its key
+   together with the postal code (Postleitzahl):
 
    ```sh
-   bauduu setup dhl --zip 44579
-   bauduu setup dhl --zip 44579 --test 00340434698381831612   # query first
+   bauduu setup dhl                                    # asks for key and postal code
+   bauduu setup dhl --api-key KEY --zip 44579 --test 00340434698381831612
+   bauduu setup dhl --api-key ""                       # remove the key
    ```
 
-   `--zip` on `track`/`watch` and `BAUDUU_DHL_ZIP` override it. Without a
-   postal code only DHL's public summary (status, progress) is available.
+   setup checks the key before saving it. With a key, `track` and `watch`
+   ask the API and fall back to dhl.de when it fails (with a warning, unless
+   the API just does not know the code). The free plan allows 250 queries a
+   day and one every five seconds; bauduu-cli waits between queries.
+   `BAUDUU_DHL_API_KEY`, `BAUDUU_DHL_ZIP` and `--zip` on `track`/`watch`
+   override the stored values.
 
 `bauduu setup` without a subcommand does both in a row, the mailbox first.
-An empty mail server or postal code skips that part; the `setup mail` flags
-and `--zip` preset the answers:
+An empty mail server skips the mailbox, no API key and postal code skip DHL;
+the flags of `setup mail` and `setup dhl` (`--api-key`, `--zip`) preset the
+answers:
 
 ```sh
 bauduu setup
-bauduu setup --host imap.example.com --mail-user me@example.com --zip 44579
+bauduu setup --host imap.example.com --mail-user me@example.com --api-key KEY --zip 44579
 ```
 
 Then:
@@ -139,27 +151,35 @@ bauduu track 00340434698381831612    # any DHL tracking code
 bauduu track -o json
 ```
 
+With an API key:
+
 ```
 Riesenrad 3in1 (31119) · DHL 00340434698381831612
-┌──────────────────┬──────────────────────┬─────────────────────────────────────────────────────┐
-│ Zeit             │ Ort                  │ Status                                              │
-├──────────────────┼──────────────────────┼─────────────────────────────────────────────────────┤
-│ 2026-10-15 11:04 │ 44579 Castrop-Rauxel │ Die Sendung wurde erfolgreich zugestellt.           │
-│ 2026-10-14 18:22 │ Dortmund             │ Die Sendung wurde im Start-Paketzentrum bearbeitet. │
-│ 2026-10-14 14:01 │                      │ Die Sendung wurde elektronisch angekündigt.         │
-└──────────────────┴──────────────────────┴─────────────────────────────────────────────────────┘
-■■■■■ Die Sendung wurde erfolgreich zugestellt. (2026-10-15 11:04)
+┌──────────────────┬───────────┬─────────────────────────────────────────────────────┐
+│ Zeit             │ Ort       │ Status                                              │
+├──────────────────┼───────────┼─────────────────────────────────────────────────────┤
+│ 2026-11-06 16:41 │           │ Die Sendung wurde zugestellt.                       │
+│ 2026-11-06 00:32 │ Bielefeld │ Die Sendung ist in der Region des Empfängers        │
+│                  │           │ angekommen.                                         │
+│ 2026-11-05 16:31 │ Bochum    │ Die Sendung wurde von DHL bearbeitet.               │
+└──────────────────┴───────────┴─────────────────────────────────────────────────────┘
+Die Sendung wurde zugestellt. (2026-11-06 16:41)
+Produkt: DHL Paket
+Absender: Bauduu & BrickCoast Steinebande gGmbH
+Adressiert an: Erika Mustermann, 44579 Castrop-Rauxel
+Zugestellt an: Empfänger:in
 https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?piececode=00340434698381831612
 ```
 
 A mail is linked to the set whose shipping date ("Versendet") is closest to
 the mail date, at most 5 days apart. Config keys: `mail_protocol`,
 `mail_host`, `mail_port`, `mail_security`, `mail_user`, `mail_password`,
-`mail_mailbox`, `mail_from` and `dhl_zip`.
+`mail_mailbox`, `mail_from`, `dhl_api_key` and `dhl_zip`.
 
-The DHL data comes from the JSON endpoints behind dhl.de's tracking page
-(`/int-verfolgen/data/…`), which are undocumented and protected against bots;
-DHL may refuse some networks (e.g. data centers) or rate-limit queries.
+Without an API key the DHL data comes from the JSON endpoints behind dhl.de's
+tracking page (`/int-verfolgen/data/…`), which are undocumented and protected
+against bots; DHL may refuse some networks (e.g. data centers) or rate-limit
+queries.
 
 ## Watch for changes (cron)
 
@@ -175,10 +195,12 @@ DHL and reports each new status or history event
 (`Bauduu: Sendung Riesenrad 3in1: Die Sendung wurde im Start-Paketzentrum
 bearbeitet.`) until the parcel is delivered (`Bauduu: Zugestellt: Riesenrad
 3in1`). The mailbox is not touched while every set at home has its code, and
-DHL is not queried after delivery. `--no-mail`, `--no-tracking` and `--zip`
-adjust this. Mailbox or DHL failures, and broken mail or postal code
-settings, are printed as warnings on stderr; the other checks still run and
-the failed one is retried next time.
+DHL is not queried after delivery (unless the last answer came from dhl.de
+because the API failed). `--no-mail`, `--no-tracking` and `--zip` adjust
+this. Mailbox or DHL failures, and broken mail or DHL settings, are printed
+as warnings on stderr; the other checks still run and the failed one is
+retried next time. Switching between the API and dhl.de reports only events
+after the last known one, as both word the history differently.
 
 `--notify` takes a `/bin/sh` command template. `{{title}}` and
 `{{description}}` (alias `{{desc}}`) become quoted references to the

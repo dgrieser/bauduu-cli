@@ -271,65 +271,94 @@ func TestUpdateShipmentsWarnsAndKeepsState(t *testing.T) {
 	}
 }
 
-func TestUpdateShipmentsKeepsHistoryWhenDetailsFail(t *testing.T) {
+func TestUpdateShipmentsFallsBackToWeb(t *testing.T) {
 	var mu sync.Mutex
-	detailsDown := true
-	events := []string{"angekündigt", "im Paketzentrum", "zugestellt"}
+	apiDown := true
 	queries := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	web := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch r.URL.Path {
 		case "/int-verfolgen/data/config":
 			io.WriteString(w, `{"verfolgenCsrfToken":"t"}`)
 		case "/int-verfolgen/data/search":
-			// The public summary: current status, no history.
-			queries++
-			io.WriteString(w, `{"sendungen":[{"id":"C1","hasCompleteDetails":false,"sendungsdetails":{"istZugestellt":true,"sendungsverlauf":{"status":"zugestellt"}}}]}`)
-		case "/int-verfolgen/data/shipment":
-			if detailsDown {
-				w.WriteHeader(http.StatusBadGateway)
-				return
-			}
-			var ev []string
-			for i, e := range events {
-				ev = append(ev, fmt.Sprintf(`{"datum":"2026-11-0%dT10:00:00.000+01:00","status":%q}`, i+1, e))
-			}
-			fmt.Fprintf(w, `{"sendungen":[{"id":"C1","hasCompleteDetails":true,"sendungsdetails":{"istZugestellt":true,"sendungsverlauf":{"status":"zugestellt","events":[%s]}}}]}`, strings.Join(ev, ","))
+			// dhl.de words and splits the events its own way.
+			io.WriteString(w, `{"sendungen":[{"id":"C1","sendungsdetails":{"istZugestellt":true,"sendungsverlauf":{"status":"Zustellung erfolgreich.","datumAktuellerStatus":"2026-11-06T16:41:00+01:00","events":[
+				{"datum":"2026-11-05T16:31:00+01:00","status":"bearbeitet"},
+				{"datum":"2026-11-06T16:41:00+01:00","status":"zugestellt"}]}}}]}`)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
-	defer srv.Close()
-	client, _ := dhl.New(srv.URL, 5*time.Second)
+	defer web.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		queries++
+		if apiDown {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		io.WriteString(w, `{"shipments":[{"id":"C1","status":{"timestamp":"2026-11-06T16:41:00","statusCode":"delivered","description":"Die Sendung wurde zugestellt."},"events":[
+			{"timestamp":"2026-11-05T16:31:00","location":{"address":{"addressLocality":"Bochum"}},"description":"Die Sendung wurde von DHL bearbeitet."},
+			{"timestamp":"2026-11-06T00:32:00","location":{"address":{"addressLocality":"Bielefeld"}},"description":"In der Region des Empfängers angekommen."},
+			{"timestamp":"2026-11-06T16:41:00","description":"Die Sendung wurde zugestellt."}]}]}`)
+	}))
+	defer api.Close()
+	client, _ := dhl.New(web.URL, 5*time.Second)
+	client.APIURL, client.APIKey, client.APIInterval = api.URL, "key", time.Millisecond
 	var warnings []error
-	env := &trackEnv{dhl: client, zip: "44579", warn: func(err error) { warnings = append(warnings, err) }}
+	env := &trackEnv{dhl: client, warn: func(err error) { warnings = append(warnings, err) }}
 	loans := []bauduu.Loan{{ID: 8, SKU: "31119-1", Name: "Riesenrad 3in1 31119", Status: "Ausgeliehen"}}
-	old := &dhl.Shipment{Status: "angekündigt", Complete: true, Events: []dhl.Event{{Status: "angekündigt"}}}
+	old := &dhl.Shipment{Source: dhl.SourceAPI, Status: "bearbeitet", StatusTime: at("2026-11-05 16:31"),
+		Events: []dhl.Event{{Time: at("2026-11-05 16:31"), Location: "Bochum", Status: "Die Sendung wurde von DHL bearbeitet."}}}
 	prev := []trackedShipment{{LoanID: 8, Carrier: "DHL", Code: "C1", Tracking: old}}
 	ctx := context.Background()
 
+	// The API fails: dhl.de reports the delivery, with a warning.
 	u := updateShipments(ctx, env, loans, prev, nil, time.Now())
-	if len(warnings) != 1 {
+	if len(warnings) != 1 || !strings.Contains(warnings[0].Error(), "dhl.de") {
 		t.Errorf("warnings = %v", warnings)
 	}
-	if tr := u.Shipments[0].Tracking; tr == nil || len(tr.Events) != 1 {
-		t.Fatalf("history lost: %+v", tr)
+	s := u.Shipments[0]
+	if s.Tracking.Source != dhl.SourceWeb || !s.Fallback || s.done() {
+		t.Fatalf("fallback = %+v", s)
 	}
-	// Delivered by the summary, but the details are still missing.
-	if u.Shipments[0].done() {
-		t.Fatal("done without details")
+	if len(u.Changes) != 1 || !strings.Contains(u.Changes[0].Line, "zugestellt") || strings.Contains(u.Changes[0].Line, "bearbeitet") {
+		t.Errorf("fallback changes = %+v", u.Changes)
 	}
+	// The API is back: only what dhl.de did not have is new, nothing old.
 	mu.Lock()
-	detailsDown = false
+	apiDown = false
 	mu.Unlock()
 	u = updateShipments(ctx, env, loans, u.Shipments, nil, time.Now())
-	if len(u.Changes) != 1 || !strings.Contains(u.Changes[0].Line, "im Paketzentrum") || !strings.Contains(u.Changes[0].Line, "zugestellt (") {
-		t.Errorf("after recovery = %+v", u.Changes)
+	if s := u.Shipments[0]; s.Tracking.Source != dhl.SourceAPI || s.Fallback || !s.done() {
+		t.Fatalf("recovered = %+v", s)
+	}
+	if len(u.Changes) != 0 {
+		t.Errorf("recovered changes = %+v", u.Changes)
 	}
 	before := queries
 	if u = updateShipments(ctx, env, loans, u.Shipments, nil, time.Now()); queries != before || len(u.Changes) != 0 {
-		t.Errorf("queried after delivery with details: %d → %d, %+v", before, queries, u.Changes)
+		t.Errorf("queried after delivery: %d → %d, %+v", before, queries, u.Changes)
+	}
+}
+
+func TestNewEventsAcrossSources(t *testing.T) {
+	web := &dhl.Shipment{Source: dhl.SourceWeb, Events: []dhl.Event{{Time: at("2026-11-05 16:31"), Status: "a"}, {Time: at("2026-11-06 09:57"), Status: "b"}}}
+	api := &dhl.Shipment{Source: dhl.SourceAPI, Events: []dhl.Event{
+		{Time: at("2026-11-05 16:31"), Location: "Bochum", Status: "A"},
+		{Time: at("2026-11-06 00:32"), Location: "Bielefeld", Status: "X"},
+		{Time: at("2026-11-06 09:57"), Status: "B"},
+		{Time: at("2026-11-06 16:41"), Status: "C"}}}
+	if got := newEvents(web, api); len(got) != 1 || got[0].Status != "C" {
+		t.Errorf("web → api = %+v", got)
+	}
+	// State of older versions has no source and counts as dhl.de.
+	old := *web
+	old.Source = ""
+	if got := newEvents(&old, web); len(got) != 0 {
+		t.Errorf("same source = %+v", got)
 	}
 }
 
@@ -458,14 +487,16 @@ func TestMailSettingsFrom(t *testing.T) {
 
 func TestShipmentTable(t *testing.T) {
 	s := trackedShipment{Set: "Riesenrad 3in1 (31119)", Carrier: "DHL", Code: "C1", Tracking: &dhl.Shipment{
-		Status: "In Zustellung", Progress: 4, MaxProgress: 5, Complete: true, URL: dhl.TrackingURL("C1"),
+		Status: "In Zustellung", Progress: 4, MaxProgress: 5, URL: dhl.TrackingURL("C1"), Source: dhl.SourceAPI,
+		Product: "DHL Paket", Sender: "Bauduu", Recipient: "Erika Mustermann", Destination: "44579 Castrop-Rauxel", NextStep: "Zustellung heute",
 		DeliveryFrom: at("2026-11-07 10:00"), DeliveryTo: at("2026-11-07 12:00"),
 		Events: []dhl.Event{{Time: at("2026-11-06 14:01"), Status: "angekündigt"}, {Time: at("2026-11-07 08:00"), Location: "Dortmund", Status: "In Zustellung"}},
 	}}
 	var buf bytes.Buffer
-	shipmentTable(s).render(&buf, false, 80)
+	shipmentTable(s, true).render(&buf, false, 80)
 	out := buf.String()
-	for _, want := range []string{"Riesenrad 3in1 (31119) · DHL C1", "■■■■□ In Zustellung", "Zustellung voraussichtlich 07.11. 10:00–12:00", "2026-11-07 08:00"} {
+	for _, want := range []string{"Riesenrad 3in1 (31119) · DHL C1", "■■■■□ In Zustellung", "Zustellung voraussichtlich: 07.11. 10:00–12:00", "2026-11-07 08:00",
+		"Ort", "Dortmund", "Nächster Schritt: Zustellung heute", "Produkt: DHL Paket", "Absender: Bauduu", "Adressiert an: Erika Mustermann, 44579 Castrop-Rauxel"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table lacks %q:\n%s", want, out)
 		}
@@ -473,6 +504,26 @@ func TestShipmentTable(t *testing.T) {
 	// Newest event first.
 	if strings.Index(out, "2026-11-07 08:00") > strings.Index(out, "2026-11-06 14:01") {
 		t.Errorf("events not newest first:\n%s", out)
+	}
+	if strings.Contains(out, "DHL-API") {
+		t.Errorf("API hint for API data:\n%s", out)
+	}
+
+	// dhl.de: no places, so no column, and the hint to the API.
+	web := *s.Tracking
+	web.Source, web.Recipient, web.Destination, web.Sender, web.Delivered, web.DeliveredTo = dhl.SourceWeb, "", "Deutschland", "", true, "Empfänger:in"
+	web.Events = []dhl.Event{{Time: at("2026-11-06 14:01"), Status: "angekündigt"}}
+	s.Tracking = &web
+	buf.Reset()
+	shipmentTable(s, true).render(&buf, false, 80)
+	out = buf.String()
+	for _, want := range []string{"Ziel: Deutschland", "Zugestellt an: Empfänger:in", "nur über die DHL-API"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("web table lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "│ Ort") || strings.Contains(out, "Nächster Schritt") {
+		t.Errorf("web table:\n%s", out)
 	}
 }
 
@@ -544,7 +595,7 @@ func TestSetupBoth(t *testing.T) {
 		return out.String(), err
 	}
 	// Nothing given: both parts are skipped, nothing is saved.
-	if out, err := run(); err != nil || !strings.Contains(out, "Postfach übersprungen") || !strings.Contains(out, "DHL-Details übersprungen") {
+	if out, err := run(); err != nil || !strings.Contains(out, "Postfach übersprungen") || !strings.Contains(out, "DHL übersprungen") {
 		t.Fatalf("empty = %q, %v", out, err)
 	}
 	if _, err := os.Stat(path); err == nil {
@@ -565,5 +616,50 @@ func TestSetupBoth(t *testing.T) {
 	}
 	if cfg, _ := readConfig(path); cfg[keyDHLZip] != "44579" {
 		t.Errorf("zip changed after failed mail setup: %v", cfg)
+	}
+}
+
+func TestSetupDHLAPIKey(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("DHL-API-Key") != "good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer api.Close()
+	path := filepath.Join(t.TempDir(), "config")
+	run := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		root := newRootCmd()
+		root.SetArgs(append([]string{"--config", path, "--dhl-api-url", api.URL, "setup", "dhl"}, args...))
+		root.SetOut(&out)
+		root.SetErr(io.Discard)
+		err := root.Execute()
+		return out.String(), err
+	}
+	if _, err := run("--api-key", "bad", "--zip", "32312"); err == nil || !strings.Contains(err.Error(), "ungültig") {
+		t.Errorf("bad key = %v", err)
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("bad key saved")
+	}
+	out, err := run("--api-key", "good", "--zip", "32312")
+	if err != nil || !strings.Contains(out, "Schlüssel gültig") {
+		t.Fatalf("good key = %q, %v", out, err)
+	}
+	if cfg, _ := readConfig(path); cfg[keyDHLAPIKey] != "good" || cfg[keyDHLZip] != "32312" {
+		t.Errorf("config = %v", cfg)
+	}
+	t.Setenv("BAUDUU_DHL_API_KEY", "")
+	if key, _ := resolveAPIKey(path); key != "good" {
+		t.Errorf("resolved key = %q", key)
+	}
+	// An empty key removes it and keeps the postal code.
+	if _, err := run("--api-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, _ := readConfig(path); cfg[keyDHLAPIKey] != "" || cfg[keyDHLZip] != "32312" {
+		t.Errorf("after removal = %v", cfg)
 	}
 }

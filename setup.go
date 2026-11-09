@@ -20,8 +20,8 @@ import (
 	"github.com/dgrieser/bauduu-cli/internal/mail"
 )
 
-// Config keys for the mailbox with Bauduu's shipping mails and the DHL
-// postal code.
+// Config keys for the mailbox with Bauduu's shipping mails, the DHL postal
+// code and the key for DHL's API.
 const (
 	keyMailProtocol = "mail_protocol"
 	keyMailHost     = "mail_host"
@@ -32,6 +32,7 @@ const (
 	keyMailMailbox  = "mail_mailbox"
 	keyMailFrom     = "mail_from"
 	keyDHLZip       = "dhl_zip"
+	keyDHLAPIKey    = "dhl_api_key"
 )
 
 // mailSettings is the mailbox configuration plus the sender to look for.
@@ -151,27 +152,28 @@ func newSetupCmd(opts *options) *cobra.Command {
 	df := &setupDHLFlags{}
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Configure the mailbox for shipping mails and the DHL postal code",
+		Short: "Configure the mailbox for shipping mails and DHL tracking",
 		Long: `setup stores settings in the config file (mode 0600), next to the bauduu
 login. Existing values are offered as defaults; other entries stay as they are.
 
-  bauduu setup         both, the mailbox first, then the postal code
+  bauduu setup         both, the mailbox first, then DHL
   bauduu setup mail    mailbox (IMAP or POP3) with Bauduu's shipping mails
-  bauduu setup dhl     postal code (PLZ) for full DHL tracking details
+  bauduu setup dhl     key for DHL's tracking API and the postal code (PLZ)
 
-Without a subcommand an empty mail server or postal code skips that part.
-The flags of setup mail and --zip preset the answers.`,
+Without a subcommand an empty mail server skips the mailbox, and no API key
+and postal code skip DHL. The flags of setup mail and setup dhl (--api-key,
+--zip) preset the answers.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			out := cmd.OutOrStdout()
 			if err := runSetupMail(cmd.Context(), out, opts, mf, cmd.Flags().Changed, true); err != nil {
 				return err
 			}
-			return runSetupDHL(cmd.Context(), out, opts, df, true)
+			return runSetupDHL(cmd.Context(), out, opts, df, cmd.Flags().Changed)
 		},
 	}
 	mf.register(cmd)
-	cmd.Flags().StringVar(&df.zip, "zip", "", "postal code of the delivery address (5 digits)")
+	df.register(cmd)
 	cmd.AddCommand(newSetupMailCmd(opts), newSetupDHLCmd(opts))
 	return cmd
 }
@@ -348,81 +350,143 @@ func mailboxName(s mailSettings) string {
 }
 
 type setupDHLFlags struct {
-	zip, testCode string
-	remove        bool
+	zip, apiKey, testCode string
+	remove                bool
 }
 
 func newSetupDHLCmd(opts *options) *cobra.Command {
 	f := &setupDHLFlags{}
 	cmd := &cobra.Command{
 		Use:   "dhl",
-		Short: "Store the postal code (PLZ) that unlocks full DHL tracking details",
-		Long: `DHL shows the full shipment history, the delivery time window and the
-delivery location only after entering the recipient's postal code. setup dhl
-stores it as dhl_zip in the config file; BAUDUU_DHL_ZIP or --zip on track and
-watch override it.
+		Short: "Store the key for DHL's tracking API and the delivery postal code",
+		Long: `Without further setup, track and watch read DHL's public tracking page,
+which gives the status and history but no places, sender or address: dhl.de
+only hands those out to browsers.
 
-  bauduu setup dhl --zip 44579
-  bauduu setup dhl --zip 44579 --test 00340434698381831612`,
+DHL's official API gives them. Register for free at developer.dhl.com, add
+an app with the API "Shipment Tracking - Unified" and enter its key here.
+With the recipient's postal code the API also names the places. setup dhl
+checks the key and stores both as dhl_api_key and dhl_zip in the config
+file; BAUDUU_DHL_API_KEY, BAUDUU_DHL_ZIP and --zip on track and watch
+override them. When the API fails, tracking falls back to dhl.de.
+
+The free API plan allows 250 queries a day, one every five seconds.
+
+  bauduu setup dhl
+  bauduu setup dhl --api-key KEY --zip 44579 --test 00340434698381831612
+  bauduu setup dhl --api-key ""      # remove the key`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runSetupDHL(cmd.Context(), cmd.OutOrStdout(), opts, f, false)
+			return runSetupDHL(cmd.Context(), cmd.OutOrStdout(), opts, f, cmd.Flags().Changed)
 		},
 	}
-	cmd.Flags().StringVar(&f.zip, "zip", "", "postal code of the delivery address (5 digits)")
-	cmd.Flags().StringVar(&f.testCode, "test", "", "query this tracking code with the postal code before saving")
-	cmd.Flags().BoolVar(&f.remove, "remove", false, "remove the stored postal code")
+	f.register(cmd)
+	cmd.Flags().StringVar(&f.testCode, "test", "", "query this tracking code before saving")
+	cmd.Flags().BoolVar(&f.remove, "remove", false, "remove the stored API key and postal code")
 	return cmd
 }
 
-// runSetupDHL asks for the postal code and saves it. With optional set, an
-// empty postal code skips it.
-func runSetupDHL(ctx context.Context, out io.Writer, opts *options, f *setupDHLFlags, optional bool) error {
+func (f *setupDHLFlags) register(cmd *cobra.Command) {
+	cmd.Flags().StringVar(&f.zip, "zip", "", "postal code of the delivery address (5 digits)")
+	cmd.Flags().StringVar(&f.apiKey, "api-key", "", `key for DHL's API "Shipment Tracking - Unified" (empty: remove)`)
+}
+
+// runSetupDHL asks for the API key and the postal code, checks the key and
+// saves both. Neither given nor stored skips it.
+func runSetupDHL(ctx context.Context, out io.Writer, opts *options, f *setupDHLFlags, changed func(string) bool) error {
 	if f.remove {
-		if err := updateConfig(opts.configPath, "", []kv{{keyDHLZip, ""}}); err != nil {
+		if err := updateConfig(opts.configPath, "", []kv{{keyDHLAPIKey, ""}, {keyDHLZip, ""}}); err != nil {
 			return err
 		}
-		fmt.Fprintln(out, "Postleitzahl entfernt")
+		fmt.Fprintln(out, "DHL-API-Schlüssel und Postleitzahl entfernt")
 		return nil
 	}
 	cur, err := readConfig(opts.configPath)
 	if err != nil {
 		return err
 	}
-	zip := f.zip
-	if zip == "" {
-		def := cur[keyDHLZip]
-		if zip, err = newPrompter().ask(skipHint("Postleitzahl der Lieferadresse", def, optional), def); err != nil {
-			return err
+	p := newPrompter()
+	key := cur[keyDHLAPIKey]
+	if changed("api-key") {
+		key = f.apiKey
+	} else {
+		if p.tty {
+			fmt.Fprintln(p.out, "DHL-API-Schlüssel: developer.dhl.com, App mit \"Shipment Tracking - Unified\"")
 		}
-	}
-	zip = strings.TrimSpace(zip)
-	if zip == "" && optional {
-		fmt.Fprintln(out, "Keine Postleitzahl angegeben, DHL-Details übersprungen")
-		return nil
-	}
-	if !validZip(zip) {
-		return fmt.Errorf("invalid postal code %q (want 5 digits)", zip)
-	}
-	if f.testCode != "" {
-		c, err := dhl.New(opts.dhlURL, opts.timeout)
+		v, err := p.secret(skipHint("DHL-API-Schlüssel", key, true), key != "")
 		if err != nil {
 			return err
 		}
+		if v != "" {
+			key = v
+		}
+	}
+	key = strings.TrimSpace(key)
+	zip := cur[keyDHLZip]
+	if changed("zip") {
+		zip = f.zip
+	} else if zip, err = p.ask(skipHint("Postleitzahl der Lieferadresse", zip, true), zip); err != nil {
+		return err
+	}
+	zip = strings.TrimSpace(zip)
+	if zip != "" && !validZip(zip) {
+		return fmt.Errorf("invalid postal code %q (want 5 digits)", zip)
+	}
+	if key == "" && zip == "" && cur[keyDHLAPIKey] == "" && cur[keyDHLZip] == "" {
+		fmt.Fprintln(out, "Kein DHL-API-Schlüssel und keine Postleitzahl angegeben, DHL übersprungen")
+		return nil
+	}
+	c, err := dhl.New(opts.dhlURL, opts.timeout)
+	if err != nil {
+		return err
+	}
+	c.APIURL, c.APIKey = opts.dhlAPIURL, key
+	if key != "" && key != cur[keyDHLAPIKey] {
+		switch err := c.CheckAPIKey(ctx); {
+		case errors.Is(err, dhl.ErrAPIKey):
+			return fmt.Errorf("%w (nothing saved)", err)
+		case err != nil:
+			fmt.Fprintf(out, "Schlüssel nicht geprüft: %v\n", err)
+		default:
+			fmt.Fprintln(out, "DHL-API-Schlüssel gültig")
+		}
+	}
+	if f.testCode != "" {
 		s, err := c.Track(ctx, f.testCode, zip)
 		if err != nil {
 			return fmt.Errorf("%w (nothing saved)", err)
 		}
-		fmt.Fprintf(out, "DHL %s: %s\n", s.Code, orDash(s.Status))
-		if !s.Complete {
-			fmt.Fprintln(out, "Hinweis: DHL liefert noch keine Details zu dieser Sendung.")
-		}
+		fmt.Fprintf(out, "DHL %s (%s): %s\n", s.Code, sourceName(s), orDash(s.Status))
 	}
-	if err := updateConfig(opts.configPath, "# bauduu-cli settings", []kv{{keyDHLZip, zip}}); err != nil {
+	if err := updateConfig(opts.configPath, "# bauduu-cli settings", []kv{{keyDHLAPIKey, key}, {keyDHLZip, zip}}); err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
-	fmt.Fprintf(out, "Postleitzahl %s gespeichert in %s\n", zip, opts.configPath)
+	keyState := "kein API-Schlüssel (nur dhl.de)"
+	if key != "" {
+		keyState = "API-Schlüssel gesetzt"
+	}
+	fmt.Fprintf(out, "DHL-Einstellungen gespeichert in %s: %s, Postleitzahl %s\n", opts.configPath, keyState, orDash(zip))
 	return nil
+}
+
+// resolveAPIKey returns the key for DHL's API: BAUDUU_DHL_API_KEY or the
+// config file.
+func resolveAPIKey(configPath string) (string, error) {
+	if key := strings.TrimSpace(os.Getenv("BAUDUU_DHL_API_KEY")); key != "" {
+		return key, nil
+	}
+	cfg, err := readConfig(configPath)
+	if err != nil {
+		return "", err
+	}
+	return cfg[keyDHLAPIKey], nil
+}
+
+func sourceName(s *dhl.Shipment) string {
+	if s.Source == dhl.SourceAPI {
+		return "DHL-API"
+	}
+	return "dhl.de"
 }
 
 var errNoMail = errors.New("no mailbox configured (run 'bauduu setup mail')")

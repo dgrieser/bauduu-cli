@@ -1,10 +1,13 @@
-// Package dhl reads the public DHL shipment tracking (dhl.de "Sendungsverfolgung").
+// Package dhl reads DHL shipment tracking, either from the official API
+// (developer.dhl.com, "Shipment Tracking - Unified", needs a key) or from the
+// public tracking page on dhl.de.
 //
 // The tracking page is a single page app that loads its data as JSON from
-// /int-verfolgen/data: "config" hands out a CSRF token, "search" returns the
-// public status of a piece code and a POST to "shipment" with the recipient's
-// postal code (Postleitzahl) unlocks the full details, such as the delivery
-// time window and every event of the history.
+// /int-verfolgen/data: "config" hands out a CSRF token and "search" returns
+// the public status and history of a piece code. The details behind the
+// recipient's postal code (places, address) come from a POST to "shipment",
+// which the site's bot protection only allows for browsers, so this package
+// does not ask for them; the API provides them instead.
 package dhl
 
 import (
@@ -30,10 +33,15 @@ const DefaultBaseURL = "https://www.dhl.de/"
 const DefaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 
 const (
-	pathConfig   = "int-verfolgen/data/config"
-	pathSearch   = "int-verfolgen/data/search"
-	pathShipment = "int-verfolgen/data/shipment"
-	pathPage     = "de/privatkunden/pakete-empfangen/verfolgen.html"
+	pathConfig = "int-verfolgen/data/config"
+	pathSearch = "int-verfolgen/data/search"
+	pathPage   = "de/privatkunden/pakete-empfangen/verfolgen.html"
+)
+
+// Sources of a Shipment.
+const (
+	SourceAPI = "api"
+	SourceWeb = "web"
 )
 
 // TrackingURL is the public page of a piece code, for people to open.
@@ -50,8 +58,18 @@ type Event struct {
 
 // Shipment is the tracking state of one piece code.
 type Shipment struct {
-	Code    string `json:"code"`
+	Code string `json:"code"`
+	// Source is SourceAPI or SourceWeb; empty in state saved by older
+	// versions, which only read the website.
+	Source  string `json:"source,omitempty"`
 	Product string `json:"product,omitempty"`
+	Sender  string `json:"sender,omitempty"`
+	// Recipient is the name the parcel is addressed to, Destination the
+	// place ("32312 Lübbecke") or only the country ("Deutschland").
+	Recipient   string `json:"recipient,omitempty"`
+	Destination string `json:"destination,omitempty"`
+	// DeliveredTo says who took the parcel, e.g. "Empfänger:in".
+	DeliveredTo string `json:"delivered_to,omitempty"`
 	// Status is the current status text, StatusTime when it was reached.
 	Status      string    `json:"status"`
 	StatusTime  time.Time `json:"status_time,omitzero"`
@@ -64,10 +82,6 @@ type Shipment struct {
 	DeliveryTo   time.Time `json:"delivery_to,omitzero"`
 	// Events are oldest first.
 	Events []Event `json:"events"`
-	// Complete is false while the site only shows the public summary.
-	Complete bool `json:"complete"`
-	// ZipRequired means the details need the recipient's postal code.
-	ZipRequired bool `json:"zip_required"`
 	// NotFound carries the reason when DHL knows nothing (yet) about the code.
 	NotFound string `json:"not_found,omitempty"`
 	URL      string `json:"url"`
@@ -105,6 +119,15 @@ type Client struct {
 	http      *http.Client
 	UserAgent string
 	csrf      string
+	// APIKey enables the official API; without it only the website is read.
+	APIKey string
+	// APIURL is the API's base, DefaultAPIURL unless set.
+	APIURL string
+	// APIInterval is the least time between API calls,
+	// DefaultAPIInterval unless set.
+	APIInterval time.Duration
+	// apiLast is the time of the last API call, for the rate limit.
+	apiLast time.Time
 }
 
 // New returns a client for baseURL (DefaultBaseURL if empty).
@@ -237,13 +260,34 @@ func (c *Client) ensureToken(ctx context.Context) error {
 	return nil
 }
 
-// Track returns the status of code. With a postal code (zip) it also asks for
-// the full details when the public summary does not include them.
+// Track returns the status of code. With an APIKey it asks the API, which
+// gives places and the address when zip is the recipient's postal code. When
+// the API fails, Track falls back to the website and returns its data
+// together with the API error, unless the API just does not know the code.
 func (c *Client) Track(ctx context.Context, code, zip string) (*Shipment, error) {
 	code = strings.TrimSpace(code)
 	if code == "" {
 		return nil, errors.New("DHL: empty tracking code")
 	}
+	if c.APIKey == "" {
+		return c.trackWeb(ctx, code)
+	}
+	s, err := c.trackAPI(ctx, code, zip)
+	if err == nil {
+		return s, nil
+	}
+	w, werr := c.trackWeb(ctx, code)
+	if werr != nil {
+		return nil, errors.Join(err, werr)
+	}
+	if errors.Is(err, errAPINotFound) {
+		return w, nil
+	}
+	return w, fmt.Errorf("%w; Daten von dhl.de", err)
+}
+
+// trackWeb reads the public tracking page's data.
+func (c *Client) trackWeb(ctx context.Context, code string) (*Shipment, error) {
 	if err := c.ensureToken(ctx); err != nil {
 		return nil, err
 	}
@@ -252,26 +296,10 @@ func (c *Client) Track(ctx context.Context, code, zip string) (*Shipment, error)
 	if err := c.do(ctx, http.MethodGet, pathSearch, q, nil, &res); err != nil {
 		return nil, err
 	}
-	s, err := res.shipment(code)
-	if err != nil {
-		return nil, err
-	}
-	if zip == "" || (s.Complete && !s.ZipRequired) || s.NotFound != "" {
-		return s, nil
-	}
-	var detail searchResult
-	payload := map[string]any{"piececode": code, "zip": zip, "international": false}
-	if err := c.do(ctx, http.MethodPost, pathShipment, nil, payload, &detail); err != nil {
-		return s, fmt.Errorf("DHL: Details mit PLZ %s: %w", zip, err)
-	}
-	d, err := detail.shipment(code)
-	if err != nil {
-		return s, fmt.Errorf("DHL: Details mit PLZ %s: %w", zip, err)
-	}
-	return d, nil
+	return res.shipment(code)
 }
 
-// searchResult is the JSON answer of search and shipment.
+// searchResult is the JSON answer of search.
 type searchResult struct {
 	Shipments []rawShipment `json:"sendungen"`
 }
@@ -291,10 +319,8 @@ func (r *searchResult) shipment(code string) (*Shipment, error) {
 }
 
 type rawShipment struct {
-	ID          flexValue `json:"id"`
-	Complete    bool      `json:"hasCompleteDetails"`
-	ZipRequired bool      `json:"plzBenoetigt"`
-	NotFound    *struct {
+	ID       flexValue `json:"id"`
+	NotFound *struct {
 		NoData       bool      `json:"keineDatenVerfuegbar"`
 		Invalid      bool      `json:"sendungsnummerUngueltig"`
 		TooOld       bool      `json:"sendungsdatenZuAlt"`
@@ -309,9 +335,16 @@ type rawShipment struct {
 	Details struct {
 		Delivered   bool      `json:"istZugestellt"`
 		ProductName flexValue `json:"produktName"`
-		Delivery    struct {
-			From flexValue `json:"zustellzeitfensterVon"`
-			To   flexValue `json:"zustellzeitfensterBis"`
+		Country     flexValue `json:"zielland"`
+		Sender      struct {
+			Name flexValue `json:"name"`
+		} `json:"versender"`
+		Delivery struct {
+			From      flexValue `json:"zustellzeitfensterVon"`
+			To        flexValue `json:"zustellzeitfensterBis"`
+			Recipient struct {
+				Name flexValue `json:"name"`
+			} `json:"empfaenger"`
 		} `json:"zustellung"`
 		History struct {
 			Status      flexValue `json:"status"`
@@ -333,7 +366,10 @@ func (r rawShipment) convert(code string) *Shipment {
 	h := r.Details.History
 	s := &Shipment{
 		Code:         code,
+		Source:       SourceWeb,
 		Product:      string(r.Details.ProductName),
+		Sender:       strings.TrimSpace(string(r.Details.Sender.Name)),
+		Destination:  strings.TrimSpace(string(r.Details.Country)),
 		Status:       firstNonEmpty(string(h.Status), string(h.ShortStatus)),
 		StatusTime:   parseTime(string(h.StatusDate)),
 		Progress:     atoi(string(h.Progress)),
@@ -342,9 +378,11 @@ func (r rawShipment) convert(code string) *Shipment {
 		NextStep:     string(h.NextStep),
 		DeliveryFrom: parseTime(string(r.Details.Delivery.From)),
 		DeliveryTo:   parseTime(string(r.Details.Delivery.To)),
-		Complete:     r.Complete,
-		ZipRequired:  r.ZipRequired,
 		URL:          TrackingURL(code),
+	}
+	// The site names who took a delivered parcel ("Empfänger:in").
+	if s.Delivered {
+		s.DeliveredTo = strings.TrimSpace(string(r.Details.Delivery.Recipient.Name))
 	}
 	if s.MaxProgress == 0 && s.Progress > 0 {
 		s.MaxProgress = 5
@@ -352,8 +390,8 @@ func (r rawShipment) convert(code string) *Shipment {
 	for _, e := range h.Events {
 		s.Events = append(s.Events, Event{
 			Time:     parseTime(string(e.Date)),
-			Location: strings.TrimSpace(string(e.Location)),
-			Status:   strings.TrimSpace(string(e.Status)),
+			Location: clean(string(e.Location)),
+			Status:   clean(string(e.Status)),
 		})
 	}
 	if nf := r.NotFound; nf != nil {

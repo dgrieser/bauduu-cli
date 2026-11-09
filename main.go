@@ -31,6 +31,7 @@ type options struct {
 	configPath string
 	baseURL    string
 	dhlURL     string
+	dhlAPIURL  string
 	output     string
 	timeout    time.Duration
 	noDetails  bool
@@ -105,7 +106,9 @@ come from Bauduu's shipping mails (see 'bauduu setup mail' and 'bauduu setup dhl
 	f.BoolVar(&opts.noColor, "no-color", false, "disable colors (also via NO_COLOR)")
 	f.StringVar(&opts.dhlURL, "dhl-url", dhl.DefaultBaseURL, "DHL tracking base URL")
 	_ = f.MarkHidden("base-url")
+	f.StringVar(&opts.dhlAPIURL, "dhl-api-url", dhl.DefaultAPIURL, "DHL API base URL")
 	_ = f.MarkHidden("dhl-url")
+	_ = f.MarkHidden("dhl-api-url")
 
 	sectionCmd := func(use string, aliases []string, short string, secs ...section) *cobra.Command {
 		return &cobra.Command{
