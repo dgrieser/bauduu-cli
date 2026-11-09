@@ -127,7 +127,7 @@ func TestDiffLoans(t *testing.T) {
 	}
 	got := diffLoans(old, cur, now)
 	want := []loanChange{
-		{Title: "Neues Set unterwegs: Riesenrad 3in1", Line: "Versendet: Riesenrad 3in1 (31119) am 2026-10-14"},
+		{Title: "Neues Set unterwegs: Riesenrad 3in1", Line: "Versendet: Riesenrad 3in1 (31119) am 2026-10-14", Set: "Riesenrad 3in1", State: "unterwegs"},
 		{Title: "Versand geplant", Line: "Nächster Versand ab 2026-06-16"},
 		{Title: "Retour verbucht: Arktis Basislager", Line: "Retour verbucht: Arktis Basislager (60036) am 2026-06-09 nach 42 Tagen; Bonussteine Arktis Basislager (60036): +3 (jetzt 3)"},
 		{Title: "Bonussteine: Weltraumrakete", Line: "Bonussteine Weltraumrakete (60228): +3 (jetzt 3)"},

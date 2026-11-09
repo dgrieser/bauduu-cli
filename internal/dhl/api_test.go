@@ -12,19 +12,19 @@ import (
 	"time"
 )
 
-// apiJSON follows the Unified Tracking API; events come newest first and
-// parcel-de puts its status code into status.
+// apiJSON is a real parcel-de answer with the name replaced: events come
+// newest first, places carry the country, status holds DHL's own code
+// (PO: in the delivery van) and the text is in description and remark.
 const apiJSON = `{"shipments":[{"id":"00340434698381831612","service":"parcel-de",
- "destination":{"address":{"countryCode":"DE","postalCode":"32312","addressLocality":"Lübbecke"}},
- "status":{"timestamp":"2026-11-06T16:41:00","statusCode":"delivered","status":"ZU","description":"Die Sendung wurde zugestellt."},
- "details":{"product":{"productName":"DHL Paket"},
-  "sender":{"organizationName":"Bauduu & BrickCoast Steinebande gGmbH"},
-  "receiver":{"name":"Erika Mustermann"},
-  "proofOfDelivery":{"signed":{"name":"Empfänger:in"}}},
+ "origin":{"address":{"countryCode":"DE"}},"destination":{"address":{"countryCode":"DE"}},
+ "status":{"timestamp":"2026-11-06T16:41:00","location":{"address":{"addressLocality":"Deutschland"}},"statusCode":"delivered","status":"ZU","statusDetailed":"DLVRD_ACCPT_ZU","description":"Die Sendung wurde zugestellt.","remark":"Die Sendung wurde zugestellt."},
+ "details":{"product":{"productName":"DHL PAKET"},"receiver":{"@type":"Person","name":"Erika Mustermann"},"proofOfDeliverySignedAvailable":false,"totalNumberOfPieces":1,"weight":{"unitText":"kg","value":9}},
  "events":[
-  {"timestamp":"2026-11-06T16:41:00","statusCode":"delivered","status":"ZU","description":"Die Sendung wurde zugestellt."},
-  {"timestamp":"2026-11-06T00:32:00","location":{"address":{"addressLocality":"Bielefeld"}},"statusCode":"transit","remark":"Die Sendung ist in der Region des Empfängers angekommen."},
-  {"timestamp":"2026-11-05T16:31:00","location":{"address":{"addressLocality":"Bochum"}},"statusCode":"transit","description":"Die Sendung wurde von DHL bearbeitet."}]}]}`
+  {"timestamp":"2026-11-06T16:41:00","location":{"address":{"addressLocality":"Deutschland"}},"statusCode":"delivered","status":"ZU","description":"Die Sendung wurde zugestellt."},
+  {"timestamp":"2026-11-06T09:57:00","statusCode":"transit","status":"PO","description":"Die Sendung wurde in das Zustellfahrzeug geladen. Die Zustellung erfolgt voraussichtlich heute."},
+  {"timestamp":"2026-11-06T00:32:00","location":{"address":{"addressLocality":"Bielefeld, Deutschland"}},"statusCode":"transit","status":"EE","remark":"Die Sendung ist in der Region des Empfängers angekommen."},
+  {"timestamp":"2026-11-05T18:23:00","statusCode":"pre-transit","status":"VA","description":"Die Sendung wurde elektronisch angekündigt."},
+  {"timestamp":"2026-11-05T16:31:00","location":{"address":{"addressLocality":"Bochum, Deutschland"}},"statusCode":"transit","status":"AA","description":"Die Sendung wurde von DHL bearbeitet."}]}]}`
 
 // fakeAPI answers like the Unified Tracking API; status selects the
 // answer, calls records the request times.
@@ -82,14 +82,15 @@ func TestTrackAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Source != SourceAPI || !s.Delivered || s.Status != "Die Sendung wurde zugestellt." || s.StatusTime.Hour() != 16 {
+	if s.Source != SourceAPI || !s.Delivered || s.Phase != PhaseDelivered || s.Status != "Die Sendung wurde zugestellt." || s.StatusTime.Hour() != 16 {
 		t.Fatalf("api = %+v", s)
 	}
-	if s.Product != "DHL Paket" || s.Sender != "Bauduu & BrickCoast Steinebande gGmbH" || s.Recipient != "Erika Mustermann" ||
-		s.Destination != "32312 Lübbecke" || s.DeliveredTo != "Empfänger:in" {
+	if s.Product != "DHL PAKET" || s.Recipient != "Erika Mustermann" || s.Destination != "Deutschland" || s.Sender != "" {
 		t.Errorf("details = %+v", s)
 	}
-	if len(s.Events) != 3 || s.Events[0].Location != "Bochum" || s.Events[1].Status != "Die Sendung ist in der Region des Empfängers angekommen." || s.Events[2].Status != "Die Sendung wurde zugestellt." {
+	// Oldest first, home country dropped from the places.
+	if len(s.Events) != 5 || s.Events[0].Location != "Bochum" || s.Events[2].Location != "Bielefeld" || s.Events[4].Location != "" ||
+		s.Events[2].Status != "Die Sendung ist in der Region des Empfängers angekommen." || s.Events[4].Status != "Die Sendung wurde zugestellt." {
 		t.Errorf("events = %+v", s.Events)
 	}
 	if q := f.query[0]; !strings.Contains(q, "recipientPostalCode=32312") || !strings.Contains(q, "service=parcel-de") {
@@ -125,6 +126,44 @@ func TestTrackAPIFallsBackToWeb(t *testing.T) {
 	f.status = http.StatusTooManyRequests
 	if s, err = c.Track(ctx, code, ""); err == nil || !strings.Contains(err.Error(), "Abruflimit") || s.Source != SourceWeb {
 		t.Errorf("rate limit = %+v, %v", s, err)
+	}
+}
+
+func TestAPIPhase(t *testing.T) {
+	for _, c := range []struct{ code, status, want string }{
+		{"pre-transit", "VA", PhaseAnnounced},
+		{"transit", "AA", PhaseTransit},
+		{"transit", "PO", PhaseOutForDelivery},
+		{"delivered", "ZU", PhaseDelivered},
+		{"failure", "", PhaseFailure},
+		{"unknown", "", PhaseUnknown},
+	} {
+		if got := (apiEvent{StatusCode: flexValue(c.code), Status: flexValue(c.status)}).phase(); got != c.want {
+			t.Errorf("%s/%s = %q, want %q", c.code, c.status, got, c.want)
+		}
+	}
+}
+
+func TestAPIPlace(t *testing.T) {
+	for _, c := range []struct{ locality, home, want string }{
+		{"Bochum, Deutschland", "DE", "Bochum"},
+		{"Deutschland", "DE", ""},
+		{"Wien, Österreich", "DE", "Wien, Österreich"},
+		{"Wien, Österreich", "AT", "Wien"},
+		{"Bochum", "", "Bochum"},
+	} {
+		if got := domestic(c.locality, c.home); got != c.want {
+			t.Errorf("domestic(%q, %q) = %q, want %q", c.locality, c.home, got, c.want)
+		}
+	}
+	if got := (apiAddress{PostalCode: "32312", Locality: "Lübbecke", CountryCode: "DE"}).place(""); got != "32312 Lübbecke" {
+		t.Errorf("address = %q", got)
+	}
+	if got := (apiAddress{CountryCode: "AT"}).place("DE"); got != "Österreich" {
+		t.Errorf("foreign country = %q", got)
+	}
+	if got := (apiAddress{CountryCode: "DE"}).place("DE"); got != "" {
+		t.Errorf("home country = %q", got)
 	}
 }
 

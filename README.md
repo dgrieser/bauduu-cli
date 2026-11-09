@@ -112,12 +112,13 @@ follows the parcel on dhl.de.
 
 2. DHL tracking works without setup: dhl.de's public tracking gives the
    status, progress and history, product, destination country and who took
-   the parcel. The places of the events, the sender and the address need
-   the recipient's postal code, and dhl.de only answers that query for
+   the parcel. The places of the events and the recipient's name need the
+   recipient's postal code, and dhl.de only answers that query for
    browsers. DHL's official API gives them: register for free at
    [developer.dhl.com](https://developer.dhl.com), create an app with the API
-   **Shipment Tracking - Unified** (not "Unified Push") and store its key
-   together with the postal code (Postleitzahl):
+   **Shipment Tracking - Unified** (not "Unified Push"; only the API key is
+   needed, not the secret) and store its key together with the postal code
+   (Postleitzahl), without which the API names no places either:
 
    ```sh
    bauduu setup dhl                                    # asks for key and postal code
@@ -159,15 +160,21 @@ Riesenrad 3in1 (31119) · DHL 00340434698381831612
 │ Zeit             │ Ort       │ Status                                              │
 ├──────────────────┼───────────┼─────────────────────────────────────────────────────┤
 │ 2026-11-06 16:41 │           │ Die Sendung wurde zugestellt.                       │
+│ 2026-11-06 09:57 │           │ Die Sendung wurde in das Zustellfahrzeug geladen.   │
+│                  │           │ Die Zustellung erfolgt voraussichtlich heute.       │
 │ 2026-11-06 00:32 │ Bielefeld │ Die Sendung ist in der Region des Empfängers        │
-│                  │           │ angekommen.                                         │
-│ 2026-11-05 16:31 │ Bochum    │ Die Sendung wurde von DHL bearbeitet.               │
+│                  │           │ angekommen und wird im nächsten Schritt zur         │
+│                  │           │ Zustellbasis transportiert.                         │
+│ 2026-11-05 18:23 │           │ Die Sendung wurde elektronisch angekündigt. Sobald  │
+│                  │           │ die Sendung von uns bearbeitet wurde, erhalten Sie  │
+│                  │           │ weitere Informationen.                              │
+│ 2026-11-05 16:31 │ Bochum    │ Die Sendung wurde von DHL bearbeitet und wird für   │
+│                  │           │ den Weitertransport in die Region des Empfängers    │
+│                  │           │ vorbereitet.                                        │
 └──────────────────┴───────────┴─────────────────────────────────────────────────────┘
 Die Sendung wurde zugestellt. (2026-11-06 16:41)
-Produkt: DHL Paket
-Absender: Bauduu & BrickCoast Steinebande gGmbH
-Adressiert an: Erika Mustermann, 44579 Castrop-Rauxel
-Zugestellt an: Empfänger:in
+Produkt: DHL PAKET
+Adressiert an: Erika Mustermann, Deutschland
 https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?piececode=00340434698381831612
 ```
 
@@ -191,10 +198,29 @@ With a mailbox configured, watch also follows the parcels: while a set is
 "Ausgeliehen" without a known tracking code, it searches the mailbox for
 Bauduu's shipping mail and notifies as soon as the code is known
 (`Bauduu: Trackingnummer für Riesenrad 3in1`). From then on every run queries
-DHL and reports each new status or history event
-(`Bauduu: Sendung Riesenrad 3in1: Die Sendung wurde im Start-Paketzentrum
-bearbeitet.`) until the parcel is delivered (`Bauduu: Zugestellt: Riesenrad
-3in1`). The mailbox is not touched while every set at home has its code, and
+DHL and reports each new status or history event until the parcel is
+delivered. The title says where the parcel is (`Bauduu: Sendung Riesenrad
+3in1 unterwegs (Bielefeld)`, `… angekündigt`, `… in Zustellung`,
+`Bauduu: Zugestellt: Riesenrad 3in1`), the description has the full DHL
+text:
+
+```
+Title:       Bauduu: Sendung Riesenrad 3in1 unterwegs (Bielefeld)
+Description: DHL 00340434698381831612 (Riesenrad 3in1): Die Sendung ist in der Region des Empfängers angekommen und wird im nächsten Schritt zur Zustellbasis transportiert. (Bielefeld, 06.11. 00:32)
+```
+
+Several events since the last run get one line each:
+
+```
+Title:       Bauduu: Zugestellt: Riesenrad 3in1
+Description: DHL 00340434698381831612 (Riesenrad 3in1):
+             Die Sendung wurde in das Zustellfahrzeug geladen. Die Zustellung erfolgt voraussichtlich heute. (06.11. 09:57)
+             Die Sendung wurde zugestellt. (06.11. 16:41)
+```
+
+News about one set in the same run shares a title, e.g. when the set
+ships, its mail arrives and DHL reports the first status:
+`Bauduu: Riesenrad 3in1 unterwegs (Bochum), Trackingnummer da`. The mailbox is not touched while every set at home has its code, and
 DHL is not queried after delivery (unless the last answer came from dhl.de
 because the API failed). `--no-mail`, `--no-tracking` and `--zip` adjust
 this. Mailbox or DHL failures, and broken mail or DHL settings, are printed
@@ -237,7 +263,9 @@ Description: Retour verbucht: Arktis Basislager (60036) am 2026-06-09 nach 42 Ta
 
 Several changes in one run are combined: the title then reads
 `Bauduu: 3 Änderungen bei Bisherige Sets` (or `… Neuigkeiten zur Sendung`,
-`… Änderungen` when mixed), with one description line each.
+`… Änderungen` when mixed), with one description line each (several for
+the events of a parcel). Shipping news about a single set keep a title of
+their own, see above.
 
 The state (sets, tracking codes, last DHL status) lives in
 `$XDG_STATE_HOME/bauduu/sets-<user>-<hash>.json` (default

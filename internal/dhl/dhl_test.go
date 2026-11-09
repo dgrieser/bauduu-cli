@@ -63,7 +63,7 @@ func TestTrackWeb(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Source != SourceWeb || !s.Delivered || s.Progress != 5 || s.MaxProgress != 5 || len(s.Events) != 3 {
+	if s.Source != SourceWeb || !s.Delivered || s.Phase != PhaseDelivered || s.Progress != 5 || s.MaxProgress != 5 || len(s.Events) != 3 {
 		t.Fatalf("web = %+v", s)
 	}
 	if s.Status != "Zustellung erfolgreich." || s.StatusTime.IsZero() {
@@ -77,6 +77,26 @@ func TestTrackWeb(t *testing.T) {
 	}
 	if !strings.HasSuffix(s.URL, "verfolgen.html?piececode="+code) {
 		t.Errorf("url = %q", s.URL)
+	}
+}
+
+func TestWebPhase(t *testing.T) {
+	for _, c := range []struct {
+		progress, max int
+		delivered     bool
+		want          string
+	}{
+		{0, 0, false, PhaseUnknown},
+		{1, 5, false, PhaseAnnounced},
+		{2, 5, false, PhaseTransit},
+		{3, 5, false, PhaseTransit},
+		{4, 5, false, PhaseOutForDelivery},
+		{5, 5, true, PhaseDelivered},
+		{4, 7, false, PhaseTransit},
+	} {
+		if got := webPhase(&Shipment{Progress: c.progress, MaxProgress: c.max, Delivered: c.delivered}); got != c.want {
+			t.Errorf("%d/%d = %q, want %q", c.progress, c.max, got, c.want)
+		}
 	}
 }
 

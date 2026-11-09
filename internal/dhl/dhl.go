@@ -44,6 +44,21 @@ const (
 	SourceWeb = "web"
 )
 
+// Phases of a shipment, from the API's status codes or dhl.de's progress
+// bar. PhaseUnknown is the empty string.
+const (
+	PhaseUnknown = ""
+	// PhaseAnnounced: the sender announced the parcel, DHL does not have
+	// it yet.
+	PhaseAnnounced      = "announced"
+	PhaseTransit        = "transit"
+	PhaseOutForDelivery = "out-for-delivery"
+	PhaseDelivered      = "delivered"
+	// PhaseFailure: DHL reports a problem, e.g. the parcel could not be
+	// delivered.
+	PhaseFailure = "failure"
+)
+
 // TrackingURL is the public page of a piece code, for people to open.
 func TrackingURL(code string) string {
 	return DefaultBaseURL + pathPage + "?piececode=" + url.QueryEscape(code)
@@ -71,12 +86,14 @@ type Shipment struct {
 	// DeliveredTo says who took the parcel, e.g. "Empfänger:in".
 	DeliveredTo string `json:"delivered_to,omitempty"`
 	// Status is the current status text, StatusTime when it was reached.
-	Status      string    `json:"status"`
-	StatusTime  time.Time `json:"status_time,omitzero"`
-	Progress    int       `json:"progress"`
-	MaxProgress int       `json:"max_progress"`
-	Delivered   bool      `json:"delivered"`
-	NextStep    string    `json:"next_step,omitempty"`
+	Status     string    `json:"status"`
+	StatusTime time.Time `json:"status_time,omitzero"`
+	// Phase is one of the Phase constants.
+	Phase       string `json:"phase,omitempty"`
+	Progress    int    `json:"progress"`
+	MaxProgress int    `json:"max_progress"`
+	Delivered   bool   `json:"delivered"`
+	NextStep    string `json:"next_step,omitempty"`
 	// DeliveryFrom/To is the announced delivery time window, if any.
 	DeliveryFrom time.Time `json:"delivery_from,omitzero"`
 	DeliveryTo   time.Time `json:"delivery_to,omitzero"`
@@ -413,7 +430,26 @@ func (r rawShipment) convert(code string) *Shipment {
 	if s.Status == "" && len(s.Events) > 0 {
 		s.Status = s.Events[len(s.Events)-1].Status
 	}
+	s.Phase = webPhase(s)
 	return s
+}
+
+// webPhase reads dhl.de's progress bar: 1 announced, 2 start parcel
+// center, 3 destination parcel center, 4 out for delivery, 5 delivered.
+func webPhase(s *Shipment) string {
+	switch {
+	case s.Delivered:
+		return PhaseDelivered
+	case s.Progress <= 0:
+		return PhaseUnknown
+	case s.MaxProgress != 5:
+		return PhaseTransit
+	case s.Progress == 1:
+		return PhaseAnnounced
+	case s.Progress == 4:
+		return PhaseOutForDelivery
+	}
+	return PhaseTransit
 }
 
 func firstNonEmpty(v ...string) string {

@@ -360,12 +360,13 @@ func newSetupDHLCmd(opts *options) *cobra.Command {
 		Use:   "dhl",
 		Short: "Store the key for DHL's tracking API and the delivery postal code",
 		Long: `Without further setup, track and watch read DHL's public tracking page,
-which gives the status and history but no places, sender or address: dhl.de
+which gives the status and history but no places and no recipient: dhl.de
 only hands those out to browsers.
 
 DHL's official API gives them. Register for free at developer.dhl.com, add
 an app with the API "Shipment Tracking - Unified" and enter its key here.
-With the recipient's postal code the API also names the places. setup dhl
+The API names the places and the recipient only together with the
+recipient's postal code, so enter that too. setup dhl
 checks the key and stores both as dhl_api_key and dhl_zip in the config
 file; BAUDUU_DHL_API_KEY, BAUDUU_DHL_ZIP and --zip on track and watch
 override them. When the API fails, tracking falls back to dhl.de.

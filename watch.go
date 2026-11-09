@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ type loanChange struct {
 	Line  string
 	// Shipment marks tracking news rather than a Bisherige Sets change.
 	Shipment bool
+	// Set names the set of shipping news, so news about one set can share
+	// a title: State says where the set is ("unterwegs (Bochum)"), Note
+	// adds something else ("Trackingnummer da").
+	Set, State, Note string
 }
 
 // defaultStatePath keeps one state file per account. The readable part is
@@ -141,6 +146,8 @@ func diffLoans(old, cur []bauduu.Loan, now time.Time) []loanChange {
 			changes = append(changes, loanChange{
 				Title: "Neues Set unterwegs: " + loanTitleName(l),
 				Line:  fmt.Sprintf("Versendet: %s am %s", loanLabel(l), l.Shipped),
+				Set:   loanTitleName(l),
+				State: "unterwegs",
 			})
 		case !existed:
 			changes = append(changes, loanChange{
@@ -203,6 +210,33 @@ func orDash(s string) string {
 	return s
 }
 
+// setTitle words shipping news that all concern one set as one title, e.g.
+// "Riesenrad 3in1 unterwegs (Bochum), Trackingnummer da". The last state
+// wins: DHL's status is more precise than "shipped" from Bisherige Sets.
+// It returns "" for anything else.
+func setTitle(changes []loanChange) string {
+	set, state := changes[0].Set, ""
+	var notes []string
+	for _, c := range changes {
+		if c.Set == "" || c.Set != set {
+			return ""
+		}
+		if c.State != "" {
+			state = c.State
+		}
+		if c.Note != "" && !slices.Contains(notes, c.Note) {
+			notes = append(notes, c.Note)
+		}
+	}
+	switch {
+	case state != "":
+		return strings.Join(append([]string{set + " " + state}, notes...), ", ")
+	case len(notes) > 0:
+		return set + ": " + strings.Join(notes, ", ")
+	}
+	return ""
+}
+
 // summarize turns changes into one notification title and description.
 func summarize(changes []loanChange) (title, description string) {
 	lines := make([]string, len(changes))
@@ -218,6 +252,8 @@ func summarize(changes []loanChange) (title, description string) {
 	switch {
 	case len(changes) == 1:
 		title = "Bauduu: " + changes[0].Title
+	case setTitle(changes) != "":
+		title = "Bauduu: " + setTitle(changes)
 	case shipments == 0:
 		title = fmt.Sprintf("Bauduu: %d Änderungen bei Bisherige Sets", len(changes))
 	case shipments == len(changes):
@@ -265,8 +301,11 @@ While a set is at home ("Ausgeliehen") without a known tracking code, watch
 searches the mailbox configured with 'bauduu setup mail' for Bauduu's
 shipping mail and reports the tracking code. It then queries DHL on every run
 and reports each new status until the parcel is delivered. With a key for
-DHL's API ('bauduu setup dhl') it asks the API, which also names the places,
-and falls back to dhl.de when the API fails. Mailbox or DHL failures are
+DHL's API ('bauduu setup dhl') it asks the API, which also names the places
+given the recipient's postal code, and falls back to dhl.de when the API
+fails. Titles say where the parcel is ("Sendung Riesenrad 3in1 unterwegs
+(Bielefeld)", "… in Zustellung", "Zugestellt: …"), the description lists
+each new event on a line of its own. Mailbox or DHL failures are
 printed as warnings; the rest of the run continues.
 
 The state is saved only after the notification succeeded, so a failed

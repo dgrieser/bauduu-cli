@@ -89,17 +89,20 @@ func TestAssignNotices(t *testing.T) {
 
 // fakeTracking serves the DHL endpoints with whatever state is set.
 type fakeTracking struct {
-	mu      sync.Mutex
-	status  string
-	events  []string
-	done    bool
-	queries int
+	mu       sync.Mutex
+	status   string
+	progress int
+	events   []string
+	done     bool
+	queries  int
 }
 
-func (f *fakeTracking) set(status string, done bool, events ...string) {
+// set changes the answer; progress is the step of dhl.de's progress bar
+// (1 announced … 4 out for delivery, 5 delivered).
+func (f *fakeTracking) set(status string, progress int, events ...string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.status, f.done, f.events = status, done, events
+	f.status, f.progress, f.done, f.events = status, progress, progress == 5, events
 }
 
 func (f *fakeTracking) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -115,8 +118,8 @@ func (f *fakeTracking) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ev = append(ev, fmt.Sprintf(`{"datum":"2026-11-0%dT10:00:00.000+01:00","ort":"Dortmund","status":%q}`, i+1, e))
 		}
 		fmt.Fprintf(w, `{"sendungen":[{"id":"C1","hasCompleteDetails":true,"sendungsdetails":{"istZugestellt":%t,
-			"sendungsverlauf":{"status":%q,"fortschritt":2,"maximalFortschritt":5,"events":[%s]}}}]}`,
-			f.done, f.status, strings.Join(ev, ","))
+			"sendungsverlauf":{"status":%q,"fortschritt":%d,"maximalFortschritt":5,"events":[%s]}}}]}`,
+			f.done, f.status, f.progress, strings.Join(ev, ","))
 	default:
 		http.NotFound(w, r)
 	}
@@ -137,9 +140,10 @@ func TestUpdateShipmentsTracksUntilDelivered(t *testing.T) {
 	now := time.Now()
 	ctx := context.Background()
 
-	fake.set("Die Sendung wurde elektronisch angekündigt.", false, "Die Sendung wurde elektronisch angekündigt.")
+	fake.set("Die Sendung wurde elektronisch angekündigt.", 1, "Die Sendung wurde elektronisch angekündigt.")
 	u := updateShipments(ctx, env, loans, prev, nil, now)
-	if len(u.Changes) != 1 || u.Changes[0].Title != "Sendung Riesenrad 3in1: Die Sendung wurde elektronisch angekündigt." || !u.Changes[0].Shipment {
+	if c := u.Changes; len(c) != 1 || c[0].Title != "Sendung Riesenrad 3in1 angekündigt" || !c[0].Shipment ||
+		c[0].Set != "Riesenrad 3in1" || c[0].State != "angekündigt" || strings.Contains(c[0].Line, "\n") {
 		t.Fatalf("first = %+v", u.Changes)
 	}
 	// Nothing new: nothing reported.
@@ -147,17 +151,17 @@ func TestUpdateShipmentsTracksUntilDelivered(t *testing.T) {
 	if len(u.Changes) != 0 {
 		t.Errorf("unchanged = %+v", u.Changes)
 	}
-	// Two new events: both listed in one change.
-	fake.set("In Zustellung", false, "Die Sendung wurde elektronisch angekündigt.", "Im Paketzentrum bearbeitet", "In Zustellung")
+	// Two new events: both in one change, one line each.
+	fake.set("In Zustellung", 4, "Die Sendung wurde elektronisch angekündigt.", "Im Paketzentrum bearbeitet", "In Zustellung")
 	u = updateShipments(ctx, env, loans, u.Shipments, nil, now)
 	cet := time.FixedZone("CET", 3600)
-	want := fmt.Sprintf("Im Paketzentrum bearbeitet (Dortmund, %s); In Zustellung (Dortmund, %s)",
+	want := fmt.Sprintf("DHL C1 (Riesenrad 3in1):\nIm Paketzentrum bearbeitet (Dortmund, %s)\nIn Zustellung (Dortmund, %s)",
 		time.Date(2026, 11, 2, 10, 0, 0, 0, cet).Local().Format("02.01. 15:04"),
 		time.Date(2026, 11, 3, 10, 0, 0, 0, cet).Local().Format("02.01. 15:04"))
-	if len(u.Changes) != 1 || !strings.Contains(u.Changes[0].Line, want) {
+	if len(u.Changes) != 1 || u.Changes[0].Line != want || u.Changes[0].Title != "Sendung Riesenrad 3in1 in Zustellung" {
 		t.Fatalf("events = %+v", u.Changes)
 	}
-	fake.set("Zugestellt", true, "Die Sendung wurde elektronisch angekündigt.", "Im Paketzentrum bearbeitet", "In Zustellung", "Zugestellt")
+	fake.set("Zugestellt", 5, "Die Sendung wurde elektronisch angekündigt.", "Im Paketzentrum bearbeitet", "In Zustellung", "Zugestellt")
 	u = updateShipments(ctx, env, loans, u.Shipments, nil, now)
 	if len(u.Changes) != 1 || u.Changes[0].Title != "Zugestellt: Riesenrad 3in1" {
 		t.Fatalf("delivered = %+v", u.Changes)
@@ -236,7 +240,7 @@ func TestUpdateShipmentsFindsCodeInMail(t *testing.T) {
 	if len(u.Shipments) != 1 || u.Shipments[0].Code != "00340434698381831612" || u.Shipments[0].Carrier != "DHL" {
 		t.Fatalf("shipments = %+v", u.Shipments)
 	}
-	if len(u.Changes) != 1 || u.Changes[0].Title != "Trackingnummer für Riesenrad 3in1" ||
+	if len(u.Changes) != 1 || u.Changes[0].Title != "Trackingnummer für Riesenrad 3in1" || u.Changes[0].Note != "Trackingnummer da" ||
 		!strings.Contains(u.Changes[0].Line, "DHL 00340434698381831612 https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?piececode=00340434698381831612") {
 		t.Errorf("changes = %+v", u.Changes)
 	}
@@ -396,6 +400,29 @@ func TestSummarizeMixed(t *testing.T) {
 	title, _ = summarize([]loanChange{{Title: "a", Line: "a", Shipment: true}, {Title: "b", Line: "b", Shipment: true}})
 	if title != "Bauduu: 2 Neuigkeiten zur Sendung" {
 		t.Errorf("shipments = %q", title)
+	}
+}
+
+func TestSummarizeOneSet(t *testing.T) {
+	shipped := loanChange{Title: "Neues Set unterwegs: Riesenrad 3in1", Line: "Versendet", Set: "Riesenrad 3in1", State: "unterwegs"}
+	code := loanChange{Title: "Trackingnummer für Riesenrad 3in1", Line: "Trackingnummer", Shipment: true, Set: "Riesenrad 3in1", Note: "Trackingnummer da"}
+	dhlNews := loanChange{Title: "Sendung Riesenrad 3in1 unterwegs (Bochum)", Line: "DHL", Shipment: true, Set: "Riesenrad 3in1", State: "unterwegs (Bochum)"}
+	other := loanChange{Title: "Sendung Arktis Basislager angekündigt", Line: "DHL", Shipment: true, Set: "Arktis Basislager", State: "angekündigt"}
+	for _, c := range []struct {
+		changes []loanChange
+		want    string
+	}{
+		{[]loanChange{shipped, code}, "Bauduu: Riesenrad 3in1 unterwegs, Trackingnummer da"},
+		// DHL knows better where the set is.
+		{[]loanChange{shipped, code, dhlNews}, "Bauduu: Riesenrad 3in1 unterwegs (Bochum), Trackingnummer da"},
+		{[]loanChange{code, {Line: "DHL", Shipment: true, Set: "Riesenrad 3in1"}}, "Bauduu: Riesenrad 3in1: Trackingnummer da"},
+		{[]loanChange{code, other}, "Bauduu: 2 Neuigkeiten zur Sendung"},
+		{[]loanChange{shipped, {Title: "Retour verbucht: Arktis Basislager", Line: "Retour"}}, "Bauduu: 2 Änderungen bei Bisherige Sets"},
+	} {
+		title, desc := summarize(c.changes)
+		if title != c.want || strings.Count(desc, "\n") != len(c.changes)-1 {
+			t.Errorf("title = %q, want %q (description %q)", title, c.want, desc)
+		}
 	}
 }
 

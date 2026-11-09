@@ -145,6 +145,23 @@ type apiPlace struct {
 	Address apiAddress `json:"address"`
 }
 
+// countryNames are the German names of the countries parcels most often
+// come from or go to; the API sends codes.
+var countryNames = map[string]string{
+	"AT": "Österreich", "BE": "Belgien", "CH": "Schweiz", "CZ": "Tschechien",
+	"DE": "Deutschland", "DK": "Dänemark", "ES": "Spanien", "FR": "Frankreich",
+	"GB": "Vereinigtes Königreich", "IT": "Italien", "LU": "Luxemburg",
+	"NL": "Niederlande", "PL": "Polen", "SE": "Schweden", "US": "USA",
+}
+
+func countryName(code string) string {
+	code = strings.ToUpper(clean(code))
+	if n, ok := countryNames[code]; ok {
+		return n
+	}
+	return code
+}
+
 type apiEvent struct {
 	Timestamp   flexValue `json:"timestamp"`
 	Location    apiPlace  `json:"location"`
@@ -190,13 +207,27 @@ func (e apiEvent) text() string {
 	return clean(firstNonEmpty(string(e.Description), string(e.Remark), string(e.Status)))
 }
 
-// place is "32312 Lübbecke", or what there is of it.
-func (a apiAddress) place() string {
-	p := clean(string(a.PostalCode) + " " + string(a.Locality))
-	if p == "" {
-		p = clean(string(a.CountryCode))
+// place is "32312 Lübbecke", or what there is of it. The country is
+// left out when it is home, the destination's country.
+func (a apiAddress) place(home string) string {
+	p := domestic(clean(string(a.PostalCode)+" "+string(a.Locality)), home)
+	if p == "" && !strings.EqualFold(clean(string(a.CountryCode)), home) {
+		p = countryName(string(a.CountryCode))
 	}
 	return p
+}
+
+// domestic drops the country home from a locality: parcel-de names places
+// "Bochum, Deutschland", and an event in no particular place "Deutschland".
+func domestic(locality, home string) string {
+	name := countryName(home)
+	if strings.EqualFold(locality, name) {
+		return ""
+	}
+	if l, ok := strings.CutSuffix(locality, ", "+name); ok {
+		return l
+	}
+	return locality
 }
 
 func (p apiParty) name() string {
@@ -209,18 +240,42 @@ func (p apiParty) name() string {
 	return clean(string(p.Organization))
 }
 
+// phase maps the status: parcel-de says "transit" for the delivery van too,
+// with the status code PO.
+func (e apiEvent) phase() string {
+	switch strings.ToLower(clean(string(e.StatusCode))) {
+	case "pre-transit":
+		return PhaseAnnounced
+	case "transit":
+		if strings.EqualFold(clean(string(e.Status)), "PO") {
+			return PhaseOutForDelivery
+		}
+		return PhaseTransit
+	case "delivered":
+		return PhaseDelivered
+	case "failure":
+		return PhaseFailure
+	}
+	return PhaseUnknown
+}
+
 func (r apiShipment) convert(code string) *Shipment {
+	// parcel-de ships within Germany unless the destination says otherwise.
+	home := clean(string(r.Destination.Address.CountryCode))
+	if home == "" {
+		home = "DE"
+	}
 	s := &Shipment{
 		Code:        code,
 		Source:      SourceAPI,
 		Product:     clean(string(r.Details.Product.Name)),
 		Sender:      r.Details.Sender.name(),
 		Recipient:   r.Details.Receiver.name(),
-		Destination: r.Destination.Address.place(),
+		Destination: r.Destination.Address.place(""),
 		DeliveredTo: r.Details.ProofOfDelivery.Signed.name(),
 		Status:      r.Status.text(),
 		StatusTime:  parseTime(string(r.Status.Timestamp)),
-		Delivered:   strings.EqualFold(string(r.Status.StatusCode), "delivered"),
+		Phase:       r.Status.phase(),
 		NextStep:    clean(string(r.Status.NextSteps)),
 		URL:         TrackingURL(code),
 	}
@@ -229,17 +284,28 @@ func (r apiShipment) convert(code string) *Shipment {
 	if s.DeliveryFrom.IsZero() {
 		s.DeliveryFrom = parseTime(string(r.ETA))
 	}
-	for _, e := range r.Events {
-		s.Events = append(s.Events, Event{
+	// Without a status, the newest event is the status.
+	var newest *apiEvent
+	var newestTime time.Time
+	for i, e := range r.Events {
+		ev := Event{
 			Time:     parseTime(string(e.Timestamp)),
-			Location: clean(string(e.Location.Address.Locality)),
+			Location: domestic(clean(string(e.Location.Address.Locality)), home),
 			Status:   e.text(),
-		})
+		}
+		s.Events = append(s.Events, ev)
+		if newest == nil || ev.Time.After(newestTime) {
+			newest, newestTime = &r.Events[i], ev.Time
+		}
 	}
 	sort.SliceStable(s.Events, func(i, j int) bool { return s.Events[i].Time.Before(s.Events[j].Time) })
-	if n := len(s.Events); n > 0 && s.Status == "" {
-		s.Status, s.StatusTime = s.Events[n-1].Status, s.Events[n-1].Time
+	if newest != nil && s.Status == "" {
+		s.Status, s.StatusTime = newest.text(), newestTime
 	}
+	if newest != nil && s.Phase == PhaseUnknown {
+		s.Phase = newest.phase()
+	}
+	s.Delivered = s.Phase == PhaseDelivered
 	return s
 }
 

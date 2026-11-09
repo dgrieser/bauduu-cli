@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -216,6 +217,8 @@ func updateShipments(ctx context.Context, env *trackEnv, loans []bauduu.Loan, pr
 					Title:    "Trackingnummer für " + shortSet(s.Set),
 					Line:     fmt.Sprintf("Trackingnummer für %s: %s %s %s", s.Set, orDash(s.Carrier), s.Code, trackingURL(s)),
 					Shipment: true,
+					Set:      shortSet(s.Set),
+					Note:     "Trackingnummer da",
 				})
 			}
 			u.Shipments = append(found, u.Shipments...)
@@ -309,16 +312,11 @@ func statusChanged(old, cur *dhl.Shipment) bool {
 }
 
 // trackingChanges describes what is new in cur compared to old: every new
-// history event, or the status when the history is not available.
+// history event, or the status when the history is not available. The title
+// says only where the parcel is; the description has one line per event.
 func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 	if old != nil && old.Fingerprint() == cur.Fingerprint() {
 		return nil
-	}
-	title := func(status string) string {
-		if cur.Delivered {
-			return "Zugestellt: " + shortSet(s.Set)
-		}
-		return "Sendung " + shortSet(s.Set) + ": " + status
 	}
 	var lines []string
 	fresh := newEvents(old, cur)
@@ -338,21 +336,60 @@ func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 	case cur.NotFound != "" && (old == nil || old.NotFound != cur.NotFound):
 		lines = append(lines, cur.NotFound)
 	}
-	if len(lines) == 0 && old != nil && !sameWindow(old, cur) && !cur.DeliveryFrom.IsZero() {
-		lines = append(lines, "Zustellung voraussichtlich "+deliveryWindow(cur))
+	if w := deliveryWindow(cur); w != "" && !cur.Delivered && (old == nil || !sameWindow(old, cur)) && !slices.ContainsFunc(lines, func(l string) bool { return strings.Contains(l, w) }) {
+		lines = append(lines, "Zustellung voraussichtlich "+w)
 	}
 	if len(lines) == 0 {
 		return nil
 	}
-	status := cur.Status
-	if status == "" {
-		status = lines[len(lines)-1]
+	set := shortSet(s.Set)
+	desc := fmt.Sprintf("DHL %s (%s):", s.Code, set)
+	if len(lines) == 1 {
+		desc += " " + lines[0]
+	} else {
+		desc += "\n" + strings.Join(lines, "\n")
 	}
-	desc := fmt.Sprintf("DHL %s (%s): %s", s.Code, shortSet(s.Set), strings.Join(lines, "; "))
-	if w := deliveryWindow(cur); w != "" && !cur.Delivered && (old == nil || !sameWindow(old, cur)) && !strings.Contains(desc, w) {
-		desc += "; Zustellung voraussichtlich " + w
+	located := fresh
+	if len(located) == 0 {
+		located = cur.Events
 	}
-	return []loanChange{{Title: title(status), Line: desc, Shipment: true}}
+	state := parcelState(cur, located)
+	title := "Sendung " + set + " " + state
+	switch {
+	case cur.Delivered:
+		title = "Zugestellt: " + set
+	case state == "":
+		title = "Neues zur Sendung " + set
+	}
+	return []loanChange{{Title: title, Line: desc, Shipment: true, Set: set, State: state}}
+}
+
+// parcelState says in a few words where the parcel is, for titles:
+// "unterwegs (Bielefeld)" names the newest place among events. It is ""
+// when DHL's answer does not tell.
+func parcelState(cur *dhl.Shipment, events []dhl.Event) string {
+	if cur.Delivered {
+		return "zugestellt"
+	}
+	switch cur.Phase {
+	case dhl.PhaseAnnounced:
+		return "angekündigt"
+	case dhl.PhaseTransit:
+		for i := len(events) - 1; i >= 0; i-- {
+			if events[i].Location != "" {
+				return "unterwegs (" + events[i].Location + ")"
+			}
+		}
+		return "unterwegs"
+	case dhl.PhaseOutForDelivery:
+		return "in Zustellung"
+	case dhl.PhaseFailure:
+		return "mit Zustellproblem"
+	}
+	if cur.NotFound != "" {
+		return "bei DHL noch unbekannt"
+	}
+	return ""
 }
 
 func eventLine(e dhl.Event) string {
@@ -532,8 +569,8 @@ Without arguments it loads Bisherige Sets, takes every set at home
 shipping mail (see 'bauduu setup mail') and queries DHL. With arguments it
 queries the given tracking codes directly.
 
-Without setup, the data comes from dhl.de, which shows no places, sender or
-address. With a key for DHL's API ('bauduu setup dhl') track asks the API,
+Without setup, the data comes from dhl.de, which shows no places and no
+recipient. With a key for DHL's API ('bauduu setup dhl') track asks the API,
 which names them given the recipient's postal code (--zip, BAUDUU_DHL_ZIP or
 'bauduu setup dhl'), and falls back to dhl.de when the API fails.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -710,7 +747,7 @@ func shipmentTable(s trackedShipment, apiHint bool) *table {
 	add("Zugestellt an", tr.DeliveredTo)
 	add("DHL", tr.NotFound)
 	if apiHint && source(tr) == dhl.SourceWeb && tr.NotFound == "" {
-		t.Footer = append(t.Footer, "Orte, Absender und Adresse nur über die DHL-API: 'bauduu setup dhl'")
+		t.Footer = append(t.Footer, "Orte und Empfänger nur über die DHL-API: 'bauduu setup dhl'")
 	}
 	t.Footer = append(t.Footer, tr.URL)
 	return t
