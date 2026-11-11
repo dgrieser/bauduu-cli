@@ -12,7 +12,7 @@ customer area. It logs in and prints the account sections as tables (or JSON):
 | `daten`        | Deine Daten                        | Account, customer, delivery and SEPA data (IBAN masked)         |
 | `all` / none   | everything                         | All of the above                                                |
 | `track`        | DHL Sendungsverfolgung             | Parcel status and history of the sets at home                   |
-| `mail`         | your mailbox                       | Bauduu's shipping mails and their tracking codes                |
+| `mail`         | your mailbox                       | Bauduu's shipping mails (`--returns`: DHL drop-off receipts)    |
 | `setup`        | –                                  | Configure mailbox (`setup mail`) and DHL API key (`setup dhl`)  |
 | `watch`        | Bisherige Sets + DHL               | Detect changes since the last run and notify (for cron)         |
 
@@ -181,7 +181,40 @@ https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?piececode=003
 A mail is linked to the set whose shipping date ("Versendet") is closest to
 the mail date, at most 5 days apart. Config keys: `mail_protocol`,
 `mail_host`, `mail_port`, `mail_security`, `mail_user`, `mail_password`,
-`mail_mailbox`, `mail_from`, `dhl_api_key` and `dhl_zip`.
+`mail_mailbox`, `mail_from`, `return_from`, `return_recipient`,
+`return_zip`, `dhl_api_key` and `dhl_zip`.
+
+### Returns
+
+When you drop the set off at a Packstation, DHL mails a receipt
+("Einlieferungsbeleg: Ihr Versand an der Packstation") with the
+Sendungsnummer. bauduu-cli reads it, links the parcel to the last set you
+received (the newest set at home that was shipped before the drop-off day)
+and follows it until Bauduu has it:
+
+```
+Title:       Bauduu: Rücksendung Riesenrad 3in1 unterwegs (Lübbecke), Sendungsnummer da
+Description: Rücksendung von Riesenrad 3in1 (31119) eingeliefert: DHL 00340434358243873456 https://www.dhl.de/…
+             DHL 00340434358243873456 (Rücksendung Riesenrad 3in1): Die Sendung wurde eingeliefert. (Lübbecke, 11.11. 16:27)
+```
+
+Settings (`bauduu setup mail` asks for them, or `--return-from`,
+`--return-recipient`, `--return-zip`):
+
+| Key                | Default              | Meaning                                                |
+|--------------------|----------------------|--------------------------------------------------------|
+| `return_from`      | `packstation@dhl.de` | senders of the receipts, comma-separated               |
+| `return_recipient` | `Bauduu`             | text the recipient's name must contain                 |
+| `return_zip`       | `44579`              | recipient's postal code, also used for DHL queries     |
+
+The receipt does not name the recipient, and DHL's API names it only when
+asked with the recipient's postal code, which it often does not do for
+returns either. So a parcel is only skipped when the receipt or DHL names
+another recipient or postal code; when it matches, the return counts as
+confirmed, otherwise the notification says "Empfänger … nicht bestätigt".
+Each receipt is read once; a set gets one return. `bauduu mail --returns`
+lists the receipts, `bauduu track` shows the returns next to the parcels
+from Bauduu.
 
 Without an API key the DHL data comes from the JSON endpoints behind dhl.de's
 tracking page (`/int-verfolgen/data/…`), which are undocumented and protected
@@ -220,7 +253,10 @@ Description: DHL 00340434698381831612 (Riesenrad 3in1):
 
 News about one set in the same run shares a title, e.g. when the set
 ships, its mail arrives and DHL reports the first status:
-`Bauduu: Riesenrad 3in1 unterwegs (Bochum), Trackingnummer da`. The mailbox is not touched while every set at home has its code, and
+`Bauduu: Riesenrad 3in1 unterwegs (Bochum), Trackingnummer da`. Returns
+are followed the same way (see [Returns](#returns)), titled
+`Bauduu: Rücksendung Riesenrad 3in1 …`. The mailbox is not touched while
+every set at home has its tracking code and its return, and
 DHL is not queried after delivery (unless the last answer came from dhl.de
 because the API failed). `--no-mail`, `--no-tracking` and `--zip` adjust
 this. Mailbox or DHL failures, and broken mail or DHL settings, are printed

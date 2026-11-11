@@ -246,3 +246,14 @@ func TestParseDates(t *testing.T) {
 		t.Errorf("parseShortDate = %v", got)
 	}
 }
+
+func TestParseReturnReceipt(t *testing.T) {
+	text := "Sie haben Ihre Sendung(en) erfolgreich eingeliefert.\nSendungsnummer(n):\n<a href=\"https://x/?piececode=00340434358243873456\">00340434358243873456</a> 003404343582438710701\nJJD000390007788993344\nAbgabezeitpunkt\n11.11.2026\nAbgabestelle\nPackstation 119, 32312 Lübbecke"
+	got := ParseReturnReceipt(text)
+	if len(got) != 2 || got[0] != "00340434358243873456" || got[1] != "JJD000390007788993344" {
+		t.Errorf("codes = %v", got)
+	}
+	if got := ParseReturnReceipt("Packstation 119, 32312 Lübbecke 00340434358243873456"); got != nil {
+		t.Errorf("without label = %v", got)
+	}
+}

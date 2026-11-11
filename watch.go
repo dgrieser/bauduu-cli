@@ -28,6 +28,10 @@ type watchState struct {
 	Shipments []trackedShipment `json:"shipments,omitempty"`
 	// MailSeen are mail IDs that need not be read again.
 	MailSeen []string `json:"mail_seen,omitempty"`
+	// Returns are the parcels sent back to Bauduu, ReturnMailSeen the
+	// drop-off receipts already read.
+	Returns        []trackedShipment `json:"returns,omitempty"`
+	ReturnMailSeen []string          `json:"return_mail_seen,omitempty"`
 }
 
 // loanChange is one detected difference, phrased for a notification.
@@ -305,7 +309,14 @@ DHL's API ('bauduu setup dhl') it asks the API, which also names the places
 given the recipient's postal code, and falls back to dhl.de when the API
 fails. Titles say where the parcel is ("Sendung Riesenrad 3in1 unterwegs
 (Bielefeld)", "… in Zustellung", "Zugestellt: …"), the description lists
-each new event on a line of its own. Mailbox or DHL failures are
+each new event on a line of its own.
+
+Returns work the same way: DHL's drop-off receipt from the Packstation
+(return_from, default packstation@dhl.de) gives the Sendungsnummer, which
+is linked to the last set received and tracked with the postal code
+return_zip ("Rücksendung Riesenrad 3in1 unterwegs", "Zugestellt:
+Rücksendung …"). Parcels that DHL or the receipt shows going to someone
+other than return_recipient at return_zip are skipped. Mailbox or DHL failures are
 printed as warnings; the rest of the run continues.
 
 The state is saved only after the notification succeeded, so a failed
@@ -411,9 +422,12 @@ func runWatch(ctx context.Context, out io.Writer, opts *options, w *watchOptions
 	u := updateShipments(ctx, env, loans, prev.Shipments, prev.MailSeen, now)
 	next.Shipments, next.MailSeen = u.Shipments, u.MailSeen
 	changes = append(changes, u.Changes...)
+	r := updateReturns(ctx, env, loans, prev.Returns, prev.ReturnMailSeen, u.Shipments, now)
+	next.Returns, next.ReturnMailSeen = r.Returns, r.MailSeen
+	changes = append(changes, r.Changes...)
 	if len(changes) == 0 {
 		if w.verbose {
-			fmt.Fprintf(out, "Keine Änderungen (%d Einträge, %d Sendungen, letzter Lauf %s)\n", len(loans), len(next.Shipments), prev.Checked.Local().Format(time.DateTime))
+			fmt.Fprintf(out, "Keine Änderungen (%d Einträge, %d Sendungen, %d Rücksendungen, letzter Lauf %s)\n", len(loans), len(next.Shipments), len(next.Returns), prev.Checked.Local().Format(time.DateTime))
 		}
 		if w.dryRun {
 			return nil

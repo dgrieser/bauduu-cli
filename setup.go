@@ -31,6 +31,9 @@ const (
 	keyMailPassword = "mail_password"
 	keyMailMailbox  = "mail_mailbox"
 	keyMailFrom     = "mail_from"
+	keyReturnFrom   = "return_from"
+	keyReturnName   = "return_recipient"
+	keyReturnZip    = "return_zip"
 	keyDHLZip       = "dhl_zip"
 	keyDHLAPIKey    = "dhl_api_key"
 )
@@ -38,7 +41,47 @@ const (
 // mailSettings is the mailbox configuration plus the sender to look for.
 type mailSettings struct {
 	mail.Config
-	From string
+	From   string
+	Return returnSettings
+}
+
+// returnSettings say how to recognize the parcels sent back to Bauduu: DHL's
+// drop-off receipts come from one of From, the parcel goes to a recipient
+// whose name contains Recipient, at postal code Zip.
+type returnSettings struct {
+	From      []string
+	Recipient string
+	Zip       string
+}
+
+// returnSettingsFrom reads the return settings, with Bauduu's address and
+// DHL's Packstation sender as defaults.
+func returnSettingsFrom(cfg map[string]string) (returnSettings, error) {
+	r := returnSettings{
+		From:      splitList(cfg[keyReturnFrom]),
+		Recipient: strings.TrimSpace(cfg[keyReturnName]),
+		Zip:       strings.TrimSpace(cfg[keyReturnZip]),
+	}
+	if len(r.From) == 0 {
+		r.From = []string{bauduu.ReturnSender}
+	}
+	if r.Recipient == "" {
+		r.Recipient = bauduu.ReturnRecipient
+	}
+	if r.Zip == "" {
+		r.Zip = bauduu.ReturnZip
+	}
+	if !validZip(r.Zip) {
+		return r, fmt.Errorf("config %s: invalid postal code %q (want 5 digits)", keyReturnZip, r.Zip)
+	}
+	return r, nil
+}
+
+// splitList splits a list of addresses at commas, semicolons or spaces.
+func splitList(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t'
+	})
 }
 
 // loadMailSettings reads the mailbox settings from the config file;
@@ -75,6 +118,9 @@ func mailSettingsFrom(cfg map[string]string, timeout time.Duration) (s mailSetti
 	if s.From == "" {
 		s.From = bauduu.ShippingSender
 	}
+	// Broken return settings are reported by newTrackEnv; they must not
+	// keep the mailbox from being searched for shipping mails.
+	s.Return, _ = returnSettingsFrom(cfg)
 	s.Config, err = s.Config.Normalize()
 	return s, true, err
 }
@@ -188,6 +234,7 @@ func skipHint(label, def string, optional bool) string {
 
 type setupMailFlags struct {
 	protocol, host, security, user, mailbox, from string
+	returnFrom, returnName, returnZip             string
 	port                                          int
 	noTest                                        bool
 	days                                          int
@@ -224,6 +271,9 @@ func (f *setupMailFlags) register(cmd *cobra.Command) {
 	fl.StringVar(&f.user, "mail-user", "", "mail login")
 	fl.StringVar(&f.mailbox, "mailbox", "", "IMAP folder (default INBOX)")
 	fl.StringVar(&f.from, "from", "", "sender of the shipping mails (default "+bauduu.ShippingSender+")")
+	fl.StringVar(&f.returnFrom, "return-from", "", "senders of DHL's drop-off receipts for returns, comma-separated (default "+bauduu.ReturnSender+")")
+	fl.StringVar(&f.returnName, "return-recipient", "", "part of the name returns are addressed to (default "+bauduu.ReturnRecipient+")")
+	fl.StringVar(&f.returnZip, "return-zip", "", "postal code returns are addressed to (default "+bauduu.ReturnZip+")")
 	fl.BoolVar(&f.noTest, "no-test", false, "save without testing the connection")
 	fl.IntVar(&f.days, "days", 60, "days of mail to search in the test")
 }
@@ -299,6 +349,19 @@ func runSetupMail(ctx context.Context, out io.Writer, opts *options, f *setupMai
 	if s.From, err = p.ask("Absender der Versandmails", pick("from", f.from, keyMailFrom, bauduu.ShippingSender)); err != nil {
 		return err
 	}
+	from, err := p.ask("Absender der Einlieferungsbelege (Rücksendungen, mit Komma getrennt)", pick("return-from", f.returnFrom, keyReturnFrom, bauduu.ReturnSender))
+	if err != nil {
+		return err
+	}
+	if s.Return.Recipient, err = p.ask("Empfänger der Rücksendungen enthält", pick("return-recipient", f.returnName, keyReturnName, bauduu.ReturnRecipient)); err != nil {
+		return err
+	}
+	if s.Return.Zip, err = p.ask("Postleitzahl der Rücksendungen", pick("return-zip", f.returnZip, keyReturnZip, bauduu.ReturnZip)); err != nil {
+		return err
+	}
+	if s.Return, err = returnSettingsFrom(map[string]string{keyReturnFrom: from, keyReturnName: s.Return.Recipient, keyReturnZip: s.Return.Zip}); err != nil {
+		return err
+	}
 	s.Timeout = opts.timeout
 	if s.Config, err = s.Config.Normalize(); err != nil {
 		return err
@@ -320,6 +383,11 @@ func runSetupMail(ctx context.Context, out io.Writer, opts *options, f *setupMai
 			}
 		}
 		fmt.Fprintf(out, "%d Mails von %s in den letzten %d Tagen, %d mit Trackingnummer\n", len(notices), s.From, f.days, withCode)
+		receipts, err := fetchReturnMails(ctx, s, time.Now().AddDate(0, 0, -f.days), nil)
+		if err != nil {
+			return fmt.Errorf("%w (nothing saved; --no-test saves anyway)", err)
+		}
+		fmt.Fprintf(out, "%d Einlieferungsbelege von %s in den letzten %d Tagen\n", len(receipts), strings.Join(s.Return.From, ", "), f.days)
 	}
 	mailbox := s.Mailbox
 	if s.Protocol == mail.POP3 {
@@ -334,6 +402,9 @@ func runSetupMail(ctx context.Context, out io.Writer, opts *options, f *setupMai
 		{keyMailPassword, s.Password},
 		{keyMailMailbox, mailbox},
 		{keyMailFrom, s.From},
+		{keyReturnFrom, strings.Join(s.Return.From, ", ")},
+		{keyReturnName, s.Return.Recipient},
+		{keyReturnZip, s.Return.Zip},
 	})
 	if err != nil {
 		return fmt.Errorf("save config: %w", err)

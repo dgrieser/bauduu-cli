@@ -2,6 +2,7 @@ package bauduu
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -62,4 +63,45 @@ func isDHLCode(code string) bool {
 	digits := strings.Trim(code, "0123456789") == ""
 	return digits && (len(code) == 12 || len(code) == 20 && strings.HasPrefix(code, "00340")) ||
 		strings.HasPrefix(code, "JJD")
+}
+
+// ReturnSender is the address DHL sends its Packstation drop-off receipts
+// ("Einlieferungsbeleg: Ihr Versand an der Packstation") from.
+const ReturnSender = "packstation@dhl.de"
+
+// Defaults for the address of Bauduu's returns.
+const (
+	ReturnRecipient = "Bauduu"
+	ReturnZip       = "44579"
+)
+
+var (
+	// "Sendungsnummer(n):", "Sendungsnummer:", "Sendungsnummern"
+	returnLabelRe = regexp.MustCompile(`(?i)sendungsnummer(?:\(n\)|n)?`)
+	// Piece codes: 20 digits starting with 00340, 12 digits, or JJD….
+	pieceCodeRe = regexp.MustCompile(`(?i)\b(00340\d{15}|\d{12}|JJD[0-9A-Z]{10,30})\b`)
+	// Where the list of codes ends in a drop-off receipt.
+	returnEndRe = regexp.MustCompile(`(?i)abgabe(?:zeitpunkt|stelle)|viele grüße`)
+)
+
+// ParseReturnReceipt extracts the tracking codes from a drop-off receipt:
+// the piece codes after "Sendungsnummer(n)", in order, without duplicates.
+// It returns nil when the text names no Sendungsnummer.
+func ParseReturnReceipt(text string) []string {
+	loc := returnLabelRe.FindStringIndex(text)
+	if loc == nil {
+		return nil
+	}
+	rest := text[loc[1]:]
+	if end := returnEndRe.FindStringIndex(rest); end != nil {
+		rest = rest[:end[0]]
+	}
+	var codes []string
+	for _, m := range pieceCodeRe.FindAllStringSubmatch(rest, -1) {
+		code := strings.ToUpper(m[1])
+		if !slices.Contains(codes, code) {
+			codes = append(codes, code)
+		}
+	}
+	return codes
 }

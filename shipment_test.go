@@ -193,17 +193,25 @@ func (nopLogger) Printf(string, ...any) {}
 // testMailbox serves the shipping mail fixture over plain IMAP.
 func testMailbox(t *testing.T) mailSettings {
 	t.Helper()
-	raw, err := os.ReadFile("internal/mail/testdata/shipping_mail.eml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	return testMailboxWith(t, "shipping_mail.eml")
+}
+
+// testMailboxWith serves the given fixtures from internal/mail/testdata.
+func testMailboxWith(t *testing.T, fixtures ...string) mailSettings {
+	t.Helper()
 	mem := imapmemserver.New()
 	user := imapmemserver.NewUser("erika", "secret")
 	if err := user.Create("INBOX", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := user.Append("INBOX", literal{bytes.NewReader(raw)}, &imap.AppendOptions{}); err != nil {
-		t.Fatal(err)
+	for _, name := range fixtures {
+		raw, err := os.ReadFile("internal/mail/testdata/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := user.Append("INBOX", literal{bytes.NewReader(raw)}, &imap.AppendOptions{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	mem.AddUser(user)
 	srv := imapserver.New(&imapserver.Options{
