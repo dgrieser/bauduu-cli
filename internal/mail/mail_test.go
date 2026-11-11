@@ -80,6 +80,10 @@ func TestFilter(t *testing.T) {
 	if !(Filter{From: "brickcoast.de"}).matchFrom("bauduu@brickcoast.de") {
 		t.Error("domain match")
 	}
+	multi := Filter{Senders: []string{"packstation@dhl.de", " noreply@dhl.de "}}
+	if !multi.matchFrom("noreply@dhl.de") || !multi.matchFrom("packstation@dhl.de") || multi.matchFrom("zustellung@dhl.de") {
+		t.Error("any of several senders")
+	}
 	if !f.matchDate(time.Date(2026, 10, 14, 1, 0, 0, 0, time.UTC)) || f.matchDate(time.Date(2026, 10, 13, 23, 0, 0, 0, time.UTC)) {
 		t.Error("since is a whole day")
 	}

@@ -66,21 +66,30 @@ func fetchIMAP(ctx context.Context, cfg Config, f Filter) ([]Message, error) {
 	if err != nil {
 		return nil, fmt.Errorf("IMAP select %s: %w", cfg.Mailbox, err)
 	}
-	criteria := &imap.SearchCriteria{}
-	if !f.Since.IsZero() {
-		criteria.Since = f.Since
-	}
-	if f.From != "" {
-		criteria.Header = []imap.SearchCriteriaHeaderField{{Key: "From", Value: f.From}}
-	}
-	data, err := c.UIDSearch(criteria, nil).Wait()
-	if err != nil {
-		return nil, fmt.Errorf("IMAP search: %w", err)
+	// One search per sender; nested ORs are not supported everywhere.
+	senders := f.senders()
+	if len(senders) == 0 {
+		senders = []string{""}
 	}
 	var uids []imap.UID
-	for _, uid := range data.AllUIDs() {
-		if !f.skip(imapID(sel.UIDValidity, uid)) {
-			uids = append(uids, uid)
+	found := map[imap.UID]bool{}
+	for _, from := range senders {
+		criteria := &imap.SearchCriteria{}
+		if !f.Since.IsZero() {
+			criteria.Since = f.Since
+		}
+		if from != "" {
+			criteria.Header = []imap.SearchCriteriaHeaderField{{Key: "From", Value: from}}
+		}
+		data, err := c.UIDSearch(criteria, nil).Wait()
+		if err != nil {
+			return nil, fmt.Errorf("IMAP search: %w", err)
+		}
+		for _, uid := range data.AllUIDs() {
+			if !found[uid] && !f.skip(imapID(sel.UIDValidity, uid)) {
+				found[uid] = true
+				uids = append(uids, uid)
+			}
 		}
 	}
 	if len(uids) == 0 {

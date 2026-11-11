@@ -34,6 +34,10 @@ type trackedShipment struct {
 	// Fallback means Tracking comes from dhl.de because the DHL API failed;
 	// the API is asked again even after delivery.
 	Fallback bool `json:"fallback,omitempty"`
+	// Return marks a parcel sent back to Bauduu; Confirmed means DHL or the
+	// receipt named Bauduu's address as the recipient.
+	Return    bool `json:"return,omitempty"`
+	Confirmed bool `json:"confirmed,omitempty"`
 }
 
 // trackable reports whether the carrier's tracking can be queried.
@@ -168,9 +172,12 @@ func assignNotices(pending []bauduu.Loan, known []trackedShipment, mails []notic
 type trackEnv struct {
 	mail    *mailSettings // nil: no mailbox configured or disabled
 	zip     string
-	dhl     *dhl.Client // nil: tracking disabled
-	warn    func(error)
-	verbose io.Writer
+	returns returnSettings // where returns go; Zip is used for their tracking
+	// returnsOff skips return tracking, e.g. for broken return settings.
+	returnsOff bool
+	dhl        *dhl.Client // nil: tracking disabled
+	warn       func(error)
+	verbose    io.Writer
 }
 
 // shipmentUpdate is the outcome of one tracking round.
@@ -343,6 +350,9 @@ func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 		return nil
 	}
 	set := shortSet(s.Set)
+	if s.Return {
+		set = returnLabel(*s)
+	}
 	desc := fmt.Sprintf("DHL %s (%s):", s.Code, set)
 	if len(lines) == 1 {
 		desc += " " + lines[0]
@@ -355,9 +365,14 @@ func trackingChanges(s *trackedShipment, old, cur *dhl.Shipment) []loanChange {
 	}
 	state := parcelState(cur, located)
 	title := "Sendung " + set + " " + state
+	if s.Return {
+		title = set + " " + state
+	}
 	switch {
 	case cur.Delivered:
 		title = "Zugestellt: " + set
+	case state == "" && s.Return:
+		title = "Neues zur " + set
 	case state == "":
 		title = "Neues zur Sendung " + set
 	}
@@ -448,6 +463,16 @@ func newTrackEnv(opts *options, zipFlag string, noMail, noTracking, lenient bool
 		warn:    func(err error) { fmt.Fprintln(os.Stderr, "bauduu: warning:", err) },
 		verbose: verbose,
 	}
+	// Broken return settings only turn off following returns; the rest
+	// works without them. A broken config file is reported below.
+	if cfg, err := readConfig(opts.configPath); err != nil {
+		env.returnsOff = true
+	} else if env.returns, err = returnSettingsFrom(cfg); err != nil {
+		env.returnsOff = true
+		if !noMail {
+			env.warn(fmt.Errorf("return settings: %w; returns not followed", err))
+		}
+	}
 	if !noMail {
 		s, ok, err := loadMailSettings(opts.configPath, opts.timeout)
 		switch {
@@ -486,12 +511,15 @@ func newTrackEnv(opts *options, zipFlag string, noMail, noTracking, lenient bool
 
 func newMailCmd(opts *options) *cobra.Command {
 	var days int
+	var returns bool
 	cmd := &cobra.Command{
 		Use:     "mail",
 		Aliases: []string{"mails", "versandmails"},
 		Short:   "List Bauduu's shipping mails and their tracking codes",
 		Long: `mail searches the configured mailbox (see 'bauduu setup mail') for mails from
-Bauduu's shipping address and prints their tracking codes.`,
+Bauduu's shipping address and prints their tracking codes. With --returns
+it lists DHL's drop-off receipts (default sender packstation@dhl.de, see
+return_from in the config) and their Sendungsnummern instead.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := checkOutput(opts); err != nil {
@@ -504,7 +532,22 @@ Bauduu's shipping address and prints their tracking codes.`,
 			if !ok {
 				return errNoMail
 			}
-			notices, err := fetchNotices(cmd.Context(), s, time.Now().AddDate(0, 0, -days), nil)
+			since := time.Now().AddDate(0, 0, -days)
+			out := cmd.OutOrStdout()
+			if returns {
+				receipts, err := fetchReturnMails(cmd.Context(), s, since, nil)
+				if err != nil {
+					return err
+				}
+				slices.Reverse(receipts)
+				if opts.output == "json" {
+					return encodeJSON(out, nonNil(receipts))
+				}
+				color, width := terminalInfo(out, opts.noColor)
+				returnMailsTable(receipts, s.Return.From, days).render(out, color, width)
+				return nil
+			}
+			notices, err := fetchNotices(cmd.Context(), s, since, nil)
 			if err != nil {
 				return err
 			}
@@ -512,7 +555,6 @@ Bauduu's shipping address and prints their tracking codes.`,
 			for i, j := 0, len(notices)-1; i < j; i, j = i+1, j-1 {
 				notices[i], notices[j] = notices[j], notices[i]
 			}
-			out := cmd.OutOrStdout()
 			if opts.output == "json" {
 				return encodeJSON(out, nonNil(notices))
 			}
@@ -522,7 +564,29 @@ Bauduu's shipping address and prints their tracking codes.`,
 		},
 	}
 	cmd.Flags().IntVar(&days, "days", 90, "search mails of the last n days")
+	cmd.Flags().BoolVar(&returns, "returns", false, "list DHL's drop-off receipts of returns instead")
 	return cmd
+}
+
+func returnMailsTable(receipts []returnMail, from []string, days int) *table {
+	t := &table{
+		Title: fmt.Sprintf("Einlieferungsbelege von %s (%d Tage)", strings.Join(from, ", "), days),
+		Columns: []column{
+			{Title: "Datum"},
+			{Title: "Sendungsnummer"},
+			{Title: "Betreff", Flex: true, MinWidth: 10, Drop: 1},
+		},
+	}
+	for _, m := range receipts {
+		r := t.add(m.Date.Local().Format("2006-01-02 15:04"), strings.Join(m.Codes, ", "), m.Subject)
+		if len(m.Codes) == 0 {
+			r.Style = ansiDim
+		}
+	}
+	if len(receipts) == 0 {
+		t.Footer = append(t.Footer, "Keine Mails gefunden")
+	}
+	return t
 }
 
 func noticesTable(notices []noticeMail, from string, days int) *table {
@@ -616,16 +680,20 @@ func runTrack(ctx context.Context, out io.Writer, opts *options, f *trackFlags, 
 		return err
 	}
 	// Known codes come from the watch state, if there is one.
-	var prev []trackedShipment
-	var seen []string
+	var prev, prevReturns []trackedShipment
+	var seen, returnSeen []string
 	if path := defaultStatePath(creds.User); path != "" {
 		if st, err := loadState(path); err == nil && st != nil && strings.EqualFold(st.User, creds.User) {
 			prev, seen = st.Shipments, st.MailSeen
+			prevReturns, returnSeen = st.Returns, st.ReturnMailSeen
 		}
 	}
 	// track always queries, delivered or not.
 	for i := range prev {
 		prev[i].Tracking = nil
+	}
+	for i := range prevReturns {
+		prevReturns[i].Tracking = nil
 	}
 	client, err := login(ctx, opts, creds)
 	if err != nil {
@@ -637,9 +705,11 @@ func runTrack(ctx context.Context, out io.Writer, opts *options, f *trackFlags, 
 	}
 	var failed []error
 	env.warn = func(err error) { failed = append(failed, err) }
-	u := updateShipments(ctx, env, loans, prev, seen, time.Now())
+	now := time.Now()
+	u := updateShipments(ctx, env, loans, prev, seen, now)
+	r := updateReturns(ctx, env, loans, prevReturns, returnSeen, u.Shipments, now)
 	pending := pendingLoans(loans, u.Shipments)
-	if err := renderShipments(out, opts, u.Shipments, env.dhl.APIKey == ""); err != nil {
+	if err := renderShipments(out, opts, append(r.Returns, u.Shipments...), env.dhl.APIKey == ""); err != nil {
 		return err
 	}
 	if opts.output == "table" {
@@ -650,7 +720,7 @@ func runTrack(ctx context.Context, out io.Writer, opts *options, f *trackFlags, 
 			}
 			fmt.Fprintf(out, "%s: keine Trackingnummer, %s\n", loanLabel(l), hint)
 		}
-		if len(u.Shipments) == 0 && len(pending) == 0 {
+		if len(u.Shipments) == 0 && len(r.Returns) == 0 && len(pending) == 0 {
 			fmt.Fprintln(out, "Kein Set ausgeliehen.")
 		}
 	}
@@ -677,6 +747,9 @@ func shipmentTable(s trackedShipment, apiHint bool) *table {
 	title := orDash(s.Carrier) + " " + s.Code
 	if s.Set != "" {
 		title = s.Set + " · " + title
+	}
+	if s.Return {
+		title = "Rücksendung " + title
 	}
 	t := &table{
 		Title:     title,
@@ -746,6 +819,9 @@ func shipmentTable(s trackedShipment, apiHint bool) *table {
 	}
 	add("Zugestellt an", tr.DeliveredTo)
 	add("DHL", tr.NotFound)
+	if s.Return && !s.Confirmed {
+		t.Footer = append(t.Footer, "Empfänger nicht bestätigt (DHL nennt ihn nicht)")
+	}
 	if apiHint && source(tr) == dhl.SourceWeb && tr.NotFound == "" {
 		t.Footer = append(t.Footer, "Orte und Empfänger nur über die DHL-API: 'bauduu setup dhl'")
 	}

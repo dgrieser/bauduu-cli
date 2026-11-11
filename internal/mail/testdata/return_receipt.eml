@@ -1,0 +1,29 @@
+Return-Path: <packstation@dhl.de>
+From: DHL Paket <packstation@dhl.de>
+To: erika@example.com
+Subject: Einlieferungsbeleg: Ihr Versand an der Packstation
+Date: Wed, 11 Nov 2026 16:27:06 +0100
+Message-ID: <receipt-1@dhl.de>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="b1"
+
+--b1
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<html><body>
+<p>Hallo Erika Mustermann,</p>
+<p>Sie haben Ihre Sendung(en)<strong> erfolgreich eingeliefert.</strong></p>
+<table><tr><td>
+<p><strong>Ihre Versandinformationen</strong></p>
+<p>Sendungsnummer(n):</p>
+<p><a href=3D"https://custcomm.dhl.de/go/10/x.html?piececode=3D003404343582438=
+73456">00340434358243873456</a></p>
+<p>Abgabezeitpunkt</p>
+<p><strong>11.11.2026, 16:27 Uhr</strong></p>
+<p>Abgabestelle</p>
+<p><strong>Packstation 119, 32312 L=C3=BCbbecke</strong></p>
+</td></tr></table>
+<p>Viele Gr=C3=BC=C3=9Fe</p>
+</body></html>
+--b1--

@@ -135,22 +135,39 @@ type Filter struct {
 	// From matches the sender address case-insensitively; a value without
 	// "@" matches anywhere in the address (e.g. a domain).
 	From string
+	// Senders are more addresses like From; a message from any of them,
+	// or From, matches.
+	Senders []string
 	// Since keeps messages sent on or after that day.
 	Since time.Time
 	// Skip returns true for message IDs that need not be fetched again.
 	Skip func(id string) bool
 }
 
+// senders lists From and Senders without blanks.
+func (f Filter) senders() []string {
+	var out []string
+	for _, s := range append([]string{f.From}, f.Senders...) {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (f Filter) matchFrom(addr string) bool {
-	if f.From == "" {
+	senders := f.senders()
+	if len(senders) == 0 {
 		return true
 	}
 	addr = strings.ToLower(addr)
-	want := strings.ToLower(strings.TrimSpace(f.From))
-	if strings.Contains(want, "@") {
-		return addr == want
+	for _, want := range senders {
+		want = strings.ToLower(want)
+		if strings.Contains(want, "@") && addr == want || !strings.Contains(want, "@") && strings.Contains(addr, want) {
+			return true
+		}
 	}
-	return strings.Contains(addr, want)
+	return false
 }
 
 func (f Filter) matchDate(d time.Time) bool {
